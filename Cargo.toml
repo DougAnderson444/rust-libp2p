@@ -60,6 +60,7 @@ members = [
     "transports/uds",
     "transports/webrtc-websys",
     "transports/webrtc",
+    "transports/webrtc-str0m",
     "transports/websocket-websys",
     "transports/websocket",
     "transports/webtransport-websys",
