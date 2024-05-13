@@ -67,11 +67,11 @@ impl libp2p_core::Transport for Transport {
         let addr =
             parse_webrtc_listen_addr(&addr).ok_or(TransportError::MultiaddrNotSupported(addr))?;
 
-        let (socket, addr) =
+        let socket =
             bind_socket(addr).map_err(|e| TransportError::Other(Error::IoError(e.kind())))?;
 
         self.listeners.push(
-            ListenStream::new(id, self.config.clone(), socket, addr)
+            ListenStream::new(id, self.config.clone(), socket)
                 .map_err(|e| TransportError::Other(Error::Io(e)))?,
         );
 
@@ -150,12 +150,8 @@ struct ListenStream {
 }
 impl ListenStream {
     /// Creates a new [`ListenStream`] with the given listener id, config, and socket.
-    fn new(
-        listener_id: ListenerId,
-        config: Config,
-        socket: UdpSocket,
-        listen_addr: SocketAddr,
-    ) -> io::Result<Self> {
+    fn new(listener_id: ListenerId, config: Config, socket: UdpSocket) -> io::Result<Self> {
+        let listen_addr = socket.local_addr()?;
         let if_watcher;
         let pending_event;
         if listen_addr.ip().is_unspecified() {
@@ -254,7 +250,7 @@ fn parse_webrtc_listen_addr(addr: &Multiaddr) -> Option<SocketAddr> {
 }
 
 /// Create and bind a socket address using the given [`SocketAddr`].
-fn bind_socket(addr: SocketAddr) -> Result<(UdpSocket, SocketAddr), std::io::Error> {
+fn bind_socket(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> {
     let socket = match addr.is_ipv4() {
         true => {
             let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(socket2::Protocol::UDP))?;
@@ -276,6 +272,5 @@ fn bind_socket(addr: SocketAddr) -> Result<(UdpSocket, SocketAddr), std::io::Err
     socket.set_reuse_port(true)?;
 
     let socket = UdpSocket::from_std(socket.into())?;
-    let local_address = socket.local_addr()?;
-    Ok((socket, local_address))
+    Ok(socket)
 }
