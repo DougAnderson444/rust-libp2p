@@ -23,6 +23,7 @@ tracing = { workspace = true }
 # external dependencies
 if-watch = "3.2"
 rand = "0.8"
+socket2 = { version = "0.5.5", features = ["all"] }
 str0m = "0.5.1"
 thiserror = "1"
 tokio = { workspace = true, features = ["net"], optional = true }
