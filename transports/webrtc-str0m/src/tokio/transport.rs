@@ -1,6 +1,7 @@
 //! Transport module
 
 use futures::future::BoxFuture;
+use futures::prelude::*;
 use futures::stream::SelectAll;
 use futures::Stream;
 use if_watch::tokio::IfWatcher;
@@ -8,7 +9,8 @@ use libp2p_core::multiaddr::Protocol;
 use socket2::{Domain, Socket, Type};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::task::Waker;
+use std::pin::Pin;
+use std::task::{Context, Poll, Waker};
 use tokio::net::UdpSocket;
 
 use libp2p_core::transport::{ListenerId, TransportError, TransportEvent};
@@ -63,7 +65,7 @@ impl libp2p_core::Transport for Transport {
         &mut self,
         id: libp2p_core::transport::ListenerId,
         addr: libp2p_core::Multiaddr,
-    ) -> Result<(), libp2p_core::transport::TransportError<Self::Error>> {
+    ) -> Result<(), TransportError<Self::Error>> {
         let addr =
             parse_webrtc_listen_addr(&addr).ok_or(TransportError::MultiaddrNotSupported(addr))?;
 
@@ -96,12 +98,15 @@ impl libp2p_core::Transport for Transport {
         todo!()
     }
 
+    /// Poll all listeners.
     fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<libp2p_core::transport::TransportEvent<Self::ListenerUpgrade, Self::Error>>
-    {
-        todo!()
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<TransportEvent<Self::ListenerUpgrade, Self::Error>> {
+        match self.listeners.poll_next_unpin(cx) {
+            Poll::Ready(Some(ev)) => Poll::Ready(ev),
+            _ => Poll::Pending,
+        }
     }
 
     fn address_translation(
