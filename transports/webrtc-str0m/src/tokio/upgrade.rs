@@ -10,11 +10,12 @@ use libp2p_identity as identity;
 use libp2p_webrtc_utils::noise;
 use libp2p_webrtc_utils::sdp;
 use libp2p_webrtc_utils::Fingerprint;
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 use str0m::{
     change::DtlsCert,
     channel::{ChannelConfig, ChannelId},
-    IceCreds, Rtc, RtcConfig,
+    net::{DatagramRecv, Receive},
+    IceCreds, Input, Rtc, RtcConfig,
 };
 use str0m::{net::Protocol as Str0mProtocol, Candidate};
 use tokio::net::UdpSocket;
@@ -23,14 +24,15 @@ use super::{connection::Open, fingerprint};
 
 /// Creates a new inbound WebRTC connection.
 pub(crate) async fn inbound(
-    addr: SocketAddr,
+    source: SocketAddr,
     config: RtcConfig,
     socket: Arc<UdpSocket>,
     dtls_cert: DtlsCert,
     remote_ufrag: String,
     id_keys: identity::Keypair,
+    contents: Vec<u8>,
 ) -> Result<(PeerId, Connection<Open>), Error> {
-    tracing::debug!(address=%addr, ufrag=%remote_ufrag, "new inbound connection from address");
+    tracing::debug!(address=%source, ufrag=%remote_ufrag, "new inbound connection from address");
 
     // using str0m:
     // 1) Create a new inbound connection.
@@ -40,19 +42,29 @@ pub(crate) async fn inbound(
     // 5) Poll connection for events
     // 6) Connection opened if successful
 
+    let destination = socket.local_addr().unwrap();
+    let contents: DatagramRecv = contents.as_slice().try_into().unwrap();
+
     // create new `Rtc` object for the peer and give it the received STUN message
-    let (mut rtc, noise_channel_id) = make_rtc_client(
-        &remote_ufrag,
-        &remote_ufrag,
-        addr,
-        socket.local_addr().unwrap(),
-        dtls_cert,
-    );
+    let (mut rtc, noise_channel_id) =
+        make_rtc_client(&remote_ufrag, &remote_ufrag, source, destination, dtls_cert);
+
+    rtc.handle_input(Input::Receive(
+        Instant::now(),
+        Receive {
+            source,
+            proto: Str0mProtocol::Udp,
+            destination,
+            contents,
+        },
+    ))
+    .expect("client to handle input successfully");
+
     todo!()
 }
 
 /// Create RTC client and open channel for Noise handshake.
-fn make_rtc_client(
+pub fn make_rtc_client(
     ufrag: &str,
     pass: &str,
     source: SocketAddr,

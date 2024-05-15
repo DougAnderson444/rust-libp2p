@@ -40,6 +40,7 @@ pub(crate) struct NewRemoteAddress {
     pub(crate) addr: SocketAddr,
     pub(crate) ufrag: String,
     pub(crate) pass: String,
+    pub(crate) stun_msg: Vec<u8>,
 }
 
 /// Events emitted by the [`UDPManager`].
@@ -156,16 +157,17 @@ impl<S: Unpin + Connectable + Send + Sync> UDPManager<S> {
                     let nread = read_buf.filled().len();
                     buf.truncate(nread);
 
-                    match this.handle_socket_input(source, buf) {
+                    match this.handle_socket_input(source, &buf) {
                         Ok(NewSource::No) => { /* Existing connection, handled. */ }
                         Ok(NewSource::Yes(ice_creds)) => {
-                            return Poll::Ready(UDPManagerEvent::NewRemoteAddress(
-                                NewRemoteAddress {
+                            let ready =
+                                Poll::Ready(UDPManagerEvent::NewRemoteAddress(NewRemoteAddress {
                                     addr: source,
                                     ufrag: ice_creds.ufrag,
                                     pass: ice_creds.pass,
-                                },
-                            ));
+                                    stun_msg: buf,
+                                }));
+                            return ready;
                         }
                         Err(error) => {
                             return Poll::Ready(UDPManagerEvent::Error(error));
@@ -188,7 +190,7 @@ impl<S: Unpin + Connectable + Send + Sync> UDPManager<S> {
     fn handle_socket_input(
         &mut self,
         source: SocketAddr,
-        buffer: Vec<u8>,
+        buffer: &[u8],
     ) -> Result<NewSource, error::Error> {
         // 1) If its Open or Opening, we have seen this addr before and we send data
         if let Some(connection) = self.addr_conns.get_mut(&source) {

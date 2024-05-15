@@ -13,6 +13,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
+use str0m::net::DatagramRecv;
 use tokio::net::UdpSocket;
 
 use libp2p_core::transport::{ListenerId, TransportError, TransportEvent};
@@ -303,16 +304,15 @@ impl<S: 'static + Unpin + Connectable + Send + Sync> Stream for ListenStream<S> 
                         self.config.inner.dtls_cert().unwrap().clone(),
                         new_addr.ufrag,
                         self.config.id_keys.clone(),
+                        new_addr.stun_msg,
                     )
                     .boxed();
-
-                    let listener_id = self.listener_id.clone();
 
                     return Poll::Ready(Some(TransportEvent::Incoming {
                         upgrade,
                         local_addr,
                         send_back_addr,
-                        listener_id,
+                        listener_id: self.listener_id,
                     }));
                 }
                 Poll::Ready(UDPManagerEvent::Error(err)) => {
