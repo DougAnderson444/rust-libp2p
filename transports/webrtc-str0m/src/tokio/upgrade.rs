@@ -1,7 +1,7 @@
 //! Upgrades new connections with Noise Protocol.
 
 use crate::tokio::{
-    connection::{Connectable, Connection},
+    connection::{Connectable, Connection, Opening, WebRtcEvent},
     error::Error,
     udp_manager::UDPManager,
 };
@@ -59,6 +59,16 @@ pub(crate) async fn inbound(
         },
     ))
     .expect("client to handle input successfully");
+
+    // Open a new Connection and poll on the next event
+    let mut connection = Connection::new(rtc, Opening::new(noise_channel_id));
+
+    loop {
+        match connection.poll_progress() {
+            WebRtcEvent::Timeout { timeout } => {}
+            _ => {}
+        }
+    }
 
     todo!()
 }
