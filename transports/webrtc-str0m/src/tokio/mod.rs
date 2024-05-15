@@ -4,7 +4,10 @@ mod certificate;
 mod connection;
 mod error;
 mod fingerprint;
+mod opening;
 mod transport;
+mod udp_manager;
+mod upgrade;
 
 pub use certificate::Certificate;
 pub use connection::Connection;

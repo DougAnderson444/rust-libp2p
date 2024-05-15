@@ -1,5 +1,7 @@
 //! Provide a interface wrapper over the fingerprinting functionality.
 
+use std::ops::Deref;
+
 use str0m::change::Fingerprint as Str0mFingerprint;
 
 const SHA256: &str = "sha-256";
@@ -59,6 +61,36 @@ impl Fingerprint {
 
     pub(crate) fn into_inner(self) -> libp2p_webrtc_utils::Fingerprint {
         self.0
+    }
+}
+
+impl From<libp2p_webrtc_utils::Fingerprint> for Fingerprint {
+    fn from(fingerprint: libp2p_webrtc_utils::Fingerprint) -> Self {
+        Fingerprint(fingerprint)
+    }
+}
+
+impl From<Fingerprint> for libp2p_webrtc_utils::Fingerprint {
+    fn from(fingerprint: Fingerprint) -> Self {
+        fingerprint.0
+    }
+}
+
+impl Deref for Fingerprint {
+    type Target = libp2p_webrtc_utils::Fingerprint;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Into str0m fingerprint
+impl From<Fingerprint> for Str0mFingerprint {
+    fn from(fingerprint: Fingerprint) -> Self {
+        Str0mFingerprint {
+            hash_func: SHA256.to_string(),
+            bytes: fingerprint.to_vec(),
+        }
     }
 }
 

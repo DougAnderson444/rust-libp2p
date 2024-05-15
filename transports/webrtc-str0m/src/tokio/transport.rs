@@ -5,11 +5,13 @@ use futures::prelude::*;
 use futures::stream::SelectAll;
 use futures::Stream;
 use if_watch::tokio::IfWatcher;
+use if_watch::IfEvent;
 use libp2p_core::multiaddr::Protocol;
 use socket2::{Domain, Socket, Type};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use tokio::net::UdpSocket;
 
@@ -22,16 +24,20 @@ use crate::tokio::certificate::Certificate;
 use crate::tokio::connection::Connection;
 use crate::tokio::error::Error;
 use crate::tokio::fingerprint::Fingerprint;
+use crate::tokio::udp_manager::{UDPManager, UDPManagerEvent};
+
+use super::connection::{Connectable, Open};
+use super::upgrade;
 
 /// A WebRTC transport with direct p2p communication (without a STUN server).
-pub struct Transport {
+pub struct Transport<S: 'static + Unpin + Connectable + Send + Sync> {
     /// The config which holds this peer's keys and certificate.
     config: Config,
     /// All the active listeners.
-    listeners: SelectAll<ListenStream>,
+    listeners: SelectAll<ListenStream<S>>,
 }
 
-impl Transport {
+impl<S: Unpin + Connectable + Send + Sync> Transport<S> {
     /// Creates a new WebRTC transport.
     ///
     /// # Example
@@ -52,8 +58,8 @@ impl Transport {
     }
 }
 
-impl libp2p_core::Transport for Transport {
-    type Output = (PeerId, Connection);
+impl<S: Unpin + Connectable + Send + Sync> libp2p_core::Transport for Transport<S> {
+    type Output = (PeerId, Connection<Open>);
 
     type Error = Error;
 
@@ -69,11 +75,11 @@ impl libp2p_core::Transport for Transport {
         let addr =
             parse_webrtc_listen_addr(&addr).ok_or(TransportError::MultiaddrNotSupported(addr))?;
 
-        let socket =
-            bind_socket(addr).map_err(|e| TransportError::Other(Error::IoError(e.kind())))?;
+        let udp_manager =
+            UDPManager::with_address(addr).map_err(|e| TransportError::Other(Error::Io(e)))?;
 
         self.listeners.push(
-            ListenStream::new(id, self.config.clone(), socket)
+            ListenStream::new(id, self.config.clone(), udp_manager)
                 .map_err(|e| TransportError::Other(Error::Io(e)))?,
         );
 
@@ -119,7 +125,7 @@ impl libp2p_core::Transport for Transport {
 }
 
 /// A stream of incoming connections on one or more interfaces.
-struct ListenStream {
+struct ListenStream<S: 'static + Unpin + Connectable + Send + Sync> {
     /// The ID of this listener.
     listener_id: ListenerId,
 
@@ -131,8 +137,8 @@ struct ListenStream {
     /// The config which holds this peer's certificate(s).
     config: Config,
 
-    /// The Socket for this listener.
-    socket: UdpSocket,
+    /// The UDP Socket manager for this listener.
+    udp_manager: UDPManager<S>,
 
     /// Set to `Some` if this listener should close.
     ///
@@ -147,16 +153,22 @@ struct ListenStream {
     /// `None` if the socket is only listening on a single interface.
     if_watcher: Option<IfWatcher>,
 
-    /// Pending event to reported.
+    /// Pending event to reported. In our case, if a Item = [TransportEvent::NewAddress] event
+    /// occurs,
     pending_event: Option<<Self as Stream>::Item>,
 
     /// The stream must be awaken after it has been closed to deliver the last event.
     close_listener_waker: Option<Waker>,
 }
-impl ListenStream {
+
+impl<S: Unpin + Connectable + Send + Sync> ListenStream<S> {
     /// Creates a new [`ListenStream`] with the given listener id, config, and socket.
-    fn new(listener_id: ListenerId, config: Config, socket: UdpSocket) -> io::Result<Self> {
-        let listen_addr = socket.local_addr()?;
+    fn new(
+        listener_id: ListenerId,
+        config: Config,
+        udp_manager: UDPManager<S>,
+    ) -> io::Result<Self> {
+        let listen_addr = udp_manager.listen_addr();
         let if_watcher;
         let pending_event;
         if listen_addr.ip().is_unspecified() {
@@ -175,23 +187,143 @@ impl ListenStream {
             listener_id,
             listen_addr,
             config,
-            socket,
+            udp_manager,
             report_closed: None,
             if_watcher,
             pending_event,
             close_listener_waker: None,
         })
     }
+
+    /// Polls the [ListenStream] for any [IfWatcher] events and relays any changes as
+    /// [TransportEvent::NewAddress], [TransportEvent::AddressExpired], or [TransportEvent::ListenerError] events.
+    fn poll_if_watcher(&mut self, cx: &mut Context<'_>) -> Poll<<Self as Stream>::Item> {
+        let Some(if_watcher) = self.if_watcher.as_mut() else {
+            return Poll::Pending;
+        };
+
+        while let Poll::Ready(event) = if_watcher.poll_if_event(cx) {
+            match event {
+                Ok(IfEvent::Up(inet)) => {
+                    let ip = inet.addr();
+                    if self.listen_addr.is_ipv4() == ip.is_ipv4()
+                        || self.listen_addr.is_ipv6() == ip.is_ipv6()
+                    {
+                        return Poll::Ready(TransportEvent::NewAddress {
+                            listener_id: self.listener_id,
+                            listen_addr: self.listen_multiaddress(ip),
+                        });
+                    }
+                }
+                Ok(IfEvent::Down(inet)) => {
+                    let ip = inet.addr();
+                    if self.listen_addr.is_ipv4() == ip.is_ipv4()
+                        || self.listen_addr.is_ipv6() == ip.is_ipv6()
+                    {
+                        return Poll::Ready(TransportEvent::AddressExpired {
+                            listener_id: self.listener_id,
+                            listen_addr: self.listen_multiaddress(ip),
+                        });
+                    }
+                }
+                Err(err) => {
+                    return Poll::Ready(TransportEvent::ListenerError {
+                        listener_id: self.listener_id,
+                        error: Error::Io(err),
+                    });
+                }
+            }
+        }
+
+        Poll::Pending
+    }
+
+    /// Constructs a [`Multiaddr`] for the given IP address that represents our listen address.
+    fn listen_multiaddress(&self, ip: IpAddr) -> Multiaddr {
+        let socket_addr = SocketAddr::new(ip, self.listen_addr.port());
+
+        socketaddr_to_multiaddr(&socket_addr, Some(self.config.fingerprint))
+    }
+
+    /// Report the listener as closed in a [`TransportEvent::ListenerClosed`] and
+    /// terminate the stream.
+    fn close(&mut self, reason: Result<(), Error>) {
+        match self.report_closed {
+            Some(_) => tracing::debug!("Listener was already closed"),
+            None => {
+                // Report the listener event as closed.
+                let _ = self
+                    .report_closed
+                    .insert(Some(TransportEvent::ListenerClosed {
+                        listener_id: self.listener_id,
+                        reason,
+                    }));
+
+                // Wake the stream to deliver the last event.
+                if let Some(waker) = self.close_listener_waker.take() {
+                    waker.wake();
+                }
+            }
+        }
+    }
 }
 
-impl Stream for ListenStream {
-    type Item = TransportEvent<<Transport as libp2p_core::Transport>::ListenerUpgrade, Error>;
+impl<S: 'static + Unpin + Connectable + Send + Sync> Stream for ListenStream<S> {
+    type Item = TransportEvent<<Transport<S> as libp2p_core::Transport>::ListenerUpgrade, Error>;
 
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        todo!()
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // let this = Pin::into_inner(self);
+
+        loop {
+            // If a [TransportEvent::NewAddress] event is pending, return it.
+            if let Some(event) = self.pending_event.take() {
+                return Poll::Ready(Some(event));
+            }
+            // If a Listener has been closed
+            if let Some(closed) = self.report_closed.as_mut() {
+                // Listener was closed.
+                // Report the transport event if there is one. On the next iteration, return
+                // `Poll::Ready(None)` to terminate the stream.
+                return Poll::Ready(closed.take());
+            }
+            if let Poll::Ready(event) = self.poll_if_watcher(cx) {
+                return Poll::Ready(Some(event));
+            }
+
+            match self.udp_manager.poll(cx) {
+                Poll::Ready(UDPManagerEvent::NewRemoteAddress(new_addr)) => {
+                    let local_addr =
+                        socketaddr_to_multiaddr(&self.listen_addr, Some(self.config.fingerprint));
+                    let send_back_addr = socketaddr_to_multiaddr(&new_addr.addr, None);
+
+                    let upgrade = upgrade::inbound(
+                        new_addr.addr,
+                        self.config.inner.clone(),
+                        self.udp_manager.socket(),
+                        self.config.inner.dtls_cert().unwrap().clone(),
+                        new_addr.ufrag,
+                        self.config.id_keys.clone(),
+                    )
+                    .boxed();
+
+                    let listener_id = self.listener_id.clone();
+
+                    return Poll::Ready(Some(TransportEvent::Incoming {
+                        upgrade,
+                        local_addr,
+                        send_back_addr,
+                        listener_id,
+                    }));
+                }
+                Poll::Ready(UDPManagerEvent::Error(err)) => {
+                    tracing::error!("Error in UDPManager: {:?}", err);
+                    self.close(Err(err));
+                    continue;
+                }
+                Poll::Pending => {}
+            }
+            return Poll::Pending;
+        }
     }
 }
 
@@ -252,30 +384,4 @@ fn parse_webrtc_listen_addr(addr: &Multiaddr) -> Option<SocketAddr> {
     }
 
     Some(SocketAddr::new(ip, port))
-}
-
-/// Create and bind a socket address using the given [`SocketAddr`].
-fn bind_socket(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> {
-    let socket = match addr.is_ipv4() {
-        true => {
-            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(socket2::Protocol::UDP))?;
-
-            socket.bind(&addr.into())?;
-            socket
-        }
-        false => {
-            let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(socket2::Protocol::UDP))?;
-            socket.set_only_v6(true)?;
-            socket.bind(&addr.into())?;
-            socket
-        }
-    };
-
-    socket.set_reuse_address(true)?;
-    socket.set_nonblocking(true)?;
-    #[cfg(unix)]
-    socket.set_reuse_port(true)?;
-
-    let socket = UdpSocket::from_std(socket.into())?;
-    Ok(socket)
 }
