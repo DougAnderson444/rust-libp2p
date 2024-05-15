@@ -13,7 +13,7 @@ type Multihash = multihash::Multihash<64>;
 pub struct Fingerprint(libp2p_webrtc_utils::Fingerprint);
 
 impl Fingerprint {
-    #[cfg(test)]
+    // #[cfg(test)]
     pub fn raw(bytes: [u8; 32]) -> Self {
         Self(libp2p_webrtc_utils::Fingerprint::raw(bytes))
     }
@@ -73,6 +73,12 @@ impl From<libp2p_webrtc_utils::Fingerprint> for Fingerprint {
 impl From<Fingerprint> for libp2p_webrtc_utils::Fingerprint {
     fn from(fingerprint: Fingerprint) -> Self {
         fingerprint.0
+    }
+}
+
+impl From<str0m::change::Fingerprint> for Fingerprint {
+    fn from(fingerprint: str0m::change::Fingerprint) -> Self {
+        Fingerprint::raw(fingerprint.bytes.try_into().unwrap())
     }
 }
 

@@ -1,12 +1,22 @@
 //! Connection module.
+//!
+//! There are two Stages of the Connection: [`Opening`] and [`Open`].
+//!
+//! The [`Opening`] stage is responsible for the initial handshake with the remote peer. It goes
+//! through several [`HandshakeState`]s until the connection is opened.
+
+use crate::tokio::fingerprint::Fingerprint;
+use crate::tokio::UdpSocket;
+
 use std::{
-    net::{SocketAddr, UdpSocket},
+    net::SocketAddr,
     ops::Deref,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use libp2p_identity::PeerId;
+use libp2p_webrtc_utils::noise;
 use str0m::{
     channel::{ChannelData, ChannelId},
     net::{DatagramSend, Protocol as Str0mProtocol, Receive},
@@ -25,6 +35,9 @@ pub trait Connectable {
     /// Socket received some data, process it according to the State.
     fn recv_data(&mut self, buf: &[u8]) -> Result<(), Error>;
 
+    /// Shared Rtc field
+    fn rtc(&mut self) -> &mut Rtc;
+
     /// On transmit data, with associate type for the return output
     /// Handle [`str0m::Output::Transmit`] events.
     fn on_output_transmit(&mut self, transmit: str0m::net::Transmit) -> Self::Output;
@@ -37,13 +50,14 @@ pub trait Connectable {
 
     fn on_event_ice_disconnect(&self) -> Self::Output;
 
+    /// Store the Channel Id
     fn on_event_channel_open(&mut self, channel_id: ChannelId, name: String) -> Self::Output;
 
     fn on_event_channel_data(&mut self, data: ChannelData) -> Self::Output;
 
     fn on_event_channel_close(&mut self, channel_id: ChannelId) -> Self::Output;
 
-    fn on_event_connected(&self) -> Self::Output;
+    fn on_event_connected(&mut self) -> Self::Output;
 
     fn on_event(&self, event: Event) -> Self::Output;
 }
@@ -73,6 +87,7 @@ pub enum WebRtcEvent {
     ConnectionOpened {
         /// Remote peer ID.
         peer: PeerId,
+        remote_fingerprint: Fingerprint,
         // /// Endpoint.
         // endpoint: Endpoint,
     },
@@ -81,7 +96,7 @@ pub enum WebRtcEvent {
 
 /// Opening Connection state.
 #[derive(Debug)]
-enum HandshakeState {
+pub(crate) enum HandshakeState {
     /// Connection is poisoned.
     Poisoned,
 
@@ -92,6 +107,7 @@ enum HandshakeState {
     Opened {
         // /// Noise context.
         // context: NoiseContext,
+        remote_fingerprint: Fingerprint,
     },
 
     /// Local Noise handshake has been sent to peer and the connection
@@ -109,8 +125,34 @@ enum HandshakeState {
     },
 }
 
+/// Events received from opening connections that are handled
+/// by the [`WebRtcTransport`] event loop.
+pub enum ConnectionEvent {
+    /// Connection established.
+    ConnectionEstablished {
+        /// Remote peer ID.
+        peer: PeerId,
+        remote_fingerprint: Fingerprint,
+        // // Endpoint.
+        // endpoint: Endpoint,
+    },
+
+    /// Connection to peer closed.
+    ConnectionClosed,
+
+    /// Timeout.
+    Timeout {
+        /// Timeout duration.
+        duration: Duration,
+    },
+}
+
 /// The Opening Connection state.
+#[derive(Debug)]
 pub struct Opening {
+    /// `str0m` WebRTC object.
+    rtc: Rtc,
+
     /// TX channel for sending datagrams to the connection event loop.
     tx: Sender<Vec<u8>>,
 
@@ -118,22 +160,40 @@ pub struct Opening {
     noise_channel_id: ChannelId,
 
     /// The state of the opening connection handshake
-    handshake: HandshakeState,
+    handshake_state: HandshakeState,
 }
 
 impl Opening {
     /// Creates a new `Opening` state.
-    pub fn new(noise_id: ChannelId) -> Self {
+    pub fn new(rtc: Rtc, noise_id: ChannelId) -> Self {
         Self {
+            rtc,
             tx: channel(1).0,
             noise_channel_id: noise_id,
-            handshake: HandshakeState::Closed,
+            handshake_state: HandshakeState::Closed,
         }
+    }
+
+    /// Handle timeouts while opening
+    pub fn on_timeout(&mut self) -> Result<(), Error> {
+        if let Err(error) = self.rtc.handle_input(Input::Timeout(Instant::now())) {
+            tracing::error!(
+                target: LOG_TARGET,
+                ?error,
+                "failed to handle timeout for `Rtc`"
+            );
+
+            self.rtc.disconnect();
+            return Err(Error::Disconnected);
+        }
+
+        Ok(())
     }
 }
 
 /// Peer Address
-pub struct PeerAddress(SocketAddr);
+#[derive(Debug)]
+pub struct PeerAddress(pub SocketAddr);
 
 /// PeerAddress is a smart pointer, this gets the inner value easily:
 impl Deref for PeerAddress {
@@ -145,7 +205,11 @@ impl Deref for PeerAddress {
 }
 
 /// The Open Connection state.
+#[derive(Debug)]
 pub struct Open {
+    /// `str0m` WebRTC object, moved here from Opening state.
+    rtc: Rtc,
+
     // TX channel for sending datagrams to the connection event loop.
     tx: Sender<Vec<u8>>,
     /// Peer address Newtype
@@ -156,23 +220,29 @@ pub struct Open {
     dgram_rx: Receiver<Vec<u8>>,
     /// Remote peer ID.
     peer: PeerId,
+    /// The state of the opening connection handshake
+    handshake_state: HandshakeState,
 }
 
 impl Open {
     /// Creates a new `Open` state.
     pub fn new(
+        rtc: Rtc,
         tx: Sender<Vec<u8>>,
         socket: Arc<UdpSocket>,
         peer_address: PeerAddress,
         dgram_rx: Receiver<Vec<u8>>,
         peer: PeerId,
+        handshake_state: HandshakeState,
     ) -> Self {
         Self {
+            rtc,
             tx,
             socket,
             dgram_rx,
             peer_address,
             peer,
+            handshake_state,
         }
     }
 
@@ -186,84 +256,108 @@ impl Open {
 }
 
 /// The WebRTC Connections as each of the various states
-pub struct Connection<State = Opening> {
-    // state: std::marker::PhantomData<State>,
-    /// State holds out state-specific values.
-    state: State,
-
-    // Shared values
-    /// `str0m` WebRTC object.
-    rtc: Rtc,
+#[derive(Debug)]
+pub struct Connection<Stage = Opening> {
+    // state: std::marker::PhantomData<Stage>,
+    /// Stage goes from Opening to Open. Holds out stage-specific values.
+    stage: Stage,
 }
 
-impl<State> Unpin for Connection<State> {}
+impl<Stage> Unpin for Connection<Stage> {}
 
-/// Implementations that apply to all Connection states.
-impl<State: Connectable> Connection<State> {
+/// Implementations that apply to both [Stages].
+impl<Stage: Connectable> Connection<Stage> {
     pub fn dgram_recv(&mut self, buf: &[u8]) -> Result<(), Error> {
-        // use Open or Opening try_send depending on the state
-        self.state.recv_data(buf)
+        // use Open or Opening depending on the state
+        self.stage.recv_data(buf)
     }
 
     /// Rtc Poll Output
-    fn rtc_poll_output(&mut self) -> <State as crate::tokio::connection::Connectable>::Output {
-        let output = match self.rtc.poll_output() {
+    fn rtc_poll_output(&mut self) -> <Stage as crate::tokio::connection::Connectable>::Output {
+        let output = match self.stage.rtc().poll_output() {
             Ok(output) => output,
             Err(error) => {
                 tracing::debug!(
                     target: LOG_TARGET,
                     // connection_id = ?self.connection_id,
                     ?error,
-                    "`WebRtcConnection::poll_progress()` failed",
+                    "`Connection::rtc_poll_output()` failed",
                 );
 
-                return self.state.on_rtc_error(error);
+                return self.stage.on_rtc_error(error);
             }
         };
         match output {
-            Output::Transmit(transmit) => self.state.on_output_transmit(transmit),
-            Output::Timeout(timeout) => self.state.on_output_timeout(timeout),
+            Output::Transmit(transmit) => self.stage.on_output_transmit(transmit),
+            Output::Timeout(timeout) => self.stage.on_output_timeout(timeout),
             Output::Event(e) => match e {
                 Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
-                    self.state.on_event_ice_disconnect()
+                    self.stage.on_event_ice_disconnect()
                 }
                 Event::ChannelOpen(channel_id, name) => {
-                    self.state.on_event_channel_open(channel_id, name)
+                    self.stage.on_event_channel_open(channel_id, name)
                 }
-                Event::ChannelData(data) => self.state.on_event_channel_data(data),
-                Event::ChannelClose(channel_id) => self.state.on_event_channel_close(channel_id),
-                Event::Connected => self.state.on_event_connected(),
-                event => self.state.on_event(event),
+                Event::ChannelData(data) => self.stage.on_event_channel_data(data),
+                Event::ChannelClose(channel_id) => self.stage.on_event_channel_close(channel_id),
+                Event::Connected => self.stage.on_event_connected(),
+                event => self.stage.on_event(event),
             },
         }
     }
     // self.rtc.poll_output().map_err(|e| e.into())
 }
 
+/// Configure the Open stage:
+#[derive(Debug)]
+pub struct OpenConfig {
+    /// Transport socket.
+    pub socket: Arc<UdpSocket>,
+    /// RX channel for receiving datagrams from the transport.
+    pub dgram_rx: Receiver<Vec<u8>>,
+    /// Remote peer ID.
+    pub peer: PeerId,
+    /// The state of the opening connection handshake
+    pub handshake_state: HandshakeState,
+    /// The Peer Socket Address
+    pub peer_address: PeerAddress,
+}
+
 /// Implementations that apply only to the Opening Connection state.
 impl Connection<Opening> {
     /// Creates a new `Connection` in the Opening state.
-    pub fn new(rtc: Rtc, opening: Opening) -> Self {
+    pub fn new(opening: Opening) -> Self {
         Self {
             // state: std::marker::PhantomData,
-            state: opening,
-            rtc,
+            stage: opening,
         }
     }
 
     /// Completes the connection opening process.
     /// The only way to get to Open is to go throguh Opening.
     /// Openin> to Open moves values into the Open state.
-    pub fn open(self, open: Open) -> Connection<Open> {
+    pub fn open(self, config: OpenConfig) -> Connection<Open> {
         Connection {
-            state: open,
-            rtc: self.rtc,
+            stage: Open {
+                // move the Rtc into the Open state
+                rtc: self.stage.rtc,
+                tx: self.stage.tx,
+                socket: config.socket,
+                dgram_rx: config.dgram_rx,
+                peer_address: config.peer_address,
+                peer: config.peer,
+                handshake_state: config.handshake_state,
+            },
         }
+    }
+
+    /// Handle timeout
+    pub fn on_timeout(&mut self) -> Result<(), Error> {
+        self.stage.on_timeout()
     }
 
     /// Progress the [`Connection`] opening process.
     pub(crate) fn poll_progress(&mut self) -> WebRtcEvent {
-        if !self.rtc.is_alive() {
+        if !self.stage.rtc.is_alive() {
             tracing::debug!(
                 target: LOG_TARGET,
                 "`Rtc` is not alive, closing `WebRtcConnection`"
@@ -273,42 +367,23 @@ impl Connection<Opening> {
         }
 
         loop {
-            let output = match self.rtc.poll_output() {
-                Ok(output) => output,
-                Err(error) => {
-                    tracing::debug!(
-                        target: LOG_TARGET,
-                        // connection_id = ?self.connection_id,
-                        ?error,
-                        "`WebRtcConnection::poll_progress()` failed",
-                    );
-
-                    return WebRtcEvent::ConnectionClosed;
+            match self.rtc_poll_output() {
+                WebRtcEvent::None => {
+                    continue;
                 }
-            };
-            match output {
-                Output::Transmit(transmit) => {
-                    tracing::trace!(
-                        target: LOG_TARGET,
-                        "transmit data",
-                    );
-
-                    return WebRtcEvent::Transmit {
-                        destination: transmit.destination,
-                        datagram: transmit.contents,
-                    };
-                }
-                Output::Timeout(timeout) => return WebRtcEvent::Timeout { timeout },
-                Output::Event(e) => {}
+                evt => return evt,
             }
         }
-
-        todo!()
     }
 }
 
 impl Connectable for Opening {
     type Output = WebRtcEvent;
+
+    /// has Rtc field
+    fn rtc(&mut self) -> &mut Rtc {
+        &mut self.rtc
+    }
 
     fn on_output_transmit(&mut self, transmit: str0m::net::Transmit) -> Self::Output {
         tracing::trace!(
@@ -351,6 +426,7 @@ impl Connectable for Opening {
         self.tx.try_send(message.to_vec()).map_err(|e| e.into())
     }
 
+    /// Progress the opening of the channel, as applicable.
     fn on_event_channel_open(&mut self, channel_id: ChannelId, name: String) -> Self::Output {
         tracing::trace!(
             target: LOG_TARGET,
@@ -373,6 +449,14 @@ impl Connectable for Opening {
         // TODO: no expect
         tracing::trace!(target: LOG_TARGET, "send initial noise handshake");
 
+        // let Stage::Opened { mut context } = std::mem::replace(&mut self.state, State::Poisoned)
+        // else {
+        //     return Err(Error::InvalidState);
+        // };
+        //
+        // let HandshakeState::Opened {} =
+        //     std::mem::replace(&mut self.handshake, HandshakeState::Opened {});
+
         WebRtcEvent::None
     }
 
@@ -384,8 +468,49 @@ impl Connectable for Opening {
         todo!()
     }
 
-    fn on_event_connected(&self) -> Self::Output {
-        todo!()
+    fn on_event_connected(&mut self) -> Self::Output {
+        match std::mem::replace(&mut self.handshake_state, HandshakeState::Poisoned) {
+            // Initial State should be Closed before we connect
+            HandshakeState::Closed => {
+                let remote_fp: Fingerprint = self
+                    .rtc
+                    .direct_api()
+                    .remote_dtls_fingerprint()
+                    .clone()
+                    .expect("fingerprint to exist")
+                    .into();
+                let remote_fingerprint_mh_bytes = remote_fp.to_multihash().to_bytes();
+
+                let local_fp: Fingerprint = self.rtc.direct_api().local_dtls_fingerprint().into();
+                let local_fp_mh_bytes = local_fp.to_multihash().to_bytes();
+
+                // let peer_id = noise::inbound(id_keys, data_channel, remote_fp, local_fp).await?;
+                tracing::debug!(
+                    target: LOG_TARGET,
+                    // peer = ?self.peer_address,
+                    "connection opened",
+                );
+
+                self.handshake_state = HandshakeState::Opened {
+                    remote_fingerprint: remote_fp,
+                };
+
+                WebRtcEvent::ConnectionOpened {
+                    peer: PeerId::random(),
+                    remote_fingerprint: remote_fp,
+                }
+            }
+            state => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    // connection_id = ?self.connection_id,
+                    ?state,
+                    "unexpected handshake state, invalid state for connection, should be closed",
+                );
+
+                return WebRtcEvent::ConnectionClosed;
+            }
+        }
     }
 
     fn on_event(&self, event: Event) -> Self::Output {
@@ -399,7 +524,7 @@ impl Connection<Open> {
     async fn on_connection_closed(&mut self) {
         tracing::trace!(
             target: LOG_TARGET,
-            peer = ?self.state.peer,
+            peer = ?self.stage.peer,
             "connection closed",
         );
 
@@ -412,24 +537,24 @@ impl Connection<Open> {
             // Do something
             tokio::select! {
                             biased;
-                            datagram = self.state.dgram_rx.recv() => match datagram {
+                            datagram = self.stage.dgram_rx.recv() => match datagram {
                                 Some(datagram) => {
                                     let input = Input::Receive(
                                         Instant::now(),
                                         Receive {
                                             proto: Str0mProtocol::Udp,
-                                            source: *self.state.peer_address,
-                                            destination: self.state.socket.local_addr().unwrap(),
+                                            source: *self.stage.peer_address,
+                                            destination: self.stage.socket.local_addr().unwrap(),
                                             contents: datagram.as_slice().try_into().unwrap(),
                                         },
                                     );
 
-                                    self.rtc.handle_input(input).unwrap();
+                                    self.stage.rtc.handle_input(input).unwrap();
                                 }
                                 None => {
                                     tracing::trace!(
                                         target: LOG_TARGET,
-                                        peer = ?self.state.peer,
+                                        peer = ?self.stage.peer,
                                         "read `None` from `dgram_rx`",
                                     );
                                     return self.on_connection_closed().await;

@@ -44,4 +44,8 @@ pub enum Error {
     /// Str0m Stun Error
     #[error("WebRTC Network error: `{0}`")]
     NetError(#[from] str0m::error::NetError),
+
+    /// Disconnected while Opening
+    #[error("disconnected while opening")]
+    Disconnected,
 }

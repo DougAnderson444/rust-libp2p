@@ -1,7 +1,11 @@
 //! Upgrades new connections with Noise Protocol.
 
+use crate::tokio::connection::OpenConfig;
+use crate::tokio::UdpSocket;
 use crate::tokio::{
-    connection::{Connectable, Connection, Opening, WebRtcEvent},
+    connection::{
+        Connectable, Connection, ConnectionEvent, HandshakeState, Opening, PeerAddress, WebRtcEvent,
+    },
     error::Error,
     udp_manager::UDPManager,
 };
@@ -18,9 +22,12 @@ use str0m::{
     IceCreds, Input, Rtc, RtcConfig,
 };
 use str0m::{net::Protocol as Str0mProtocol, Candidate};
-use tokio::net::UdpSocket;
+use tokio::sync;
 
-use super::{connection::Open, fingerprint};
+use super::{connection::Open, fingerprint, stream::Stream};
+
+const LOG_TARGET: &str = "libp2p_webrtc_str0m";
+const DATAGRAM_BUFFER_SIZE: usize = 1024;
 
 /// Creates a new inbound WebRTC connection.
 pub(crate) async fn inbound(
@@ -60,21 +67,98 @@ pub(crate) async fn inbound(
     ))
     .expect("client to handle input successfully");
 
+    // A handle to send datagrams to the UDP socket
+    let (tx, dgram_rx) = sync::mpsc::channel(DATAGRAM_BUFFER_SIZE);
+
     // Open a new Connection and poll on the next event
-    let mut connection = Connection::new(rtc, Opening::new(noise_channel_id));
+    let mut connection: Connection<Opening> = Connection::new(Opening::new(rtc, noise_channel_id));
 
-    loop {
+    // loop until we get a Connection event
+    let event = loop {
         match connection.poll_progress() {
-            WebRtcEvent::Timeout { timeout } => {}
-            _ => {}
-        }
-    }
+            WebRtcEvent::Timeout { timeout } => {
+                let duration = timeout - Instant::now();
 
-    todo!()
+                match duration.is_zero() {
+                    true => match connection.on_timeout() {
+                        Ok(()) => continue,
+                        Err(error) => {
+                            tracing::debug!(
+                                target: LOG_TARGET,
+                                ?source,
+                                ?error,
+                                "failed to handle timeout",
+                            );
+
+                            break ConnectionEvent::ConnectionClosed;
+                        }
+                    },
+                    false => break ConnectionEvent::Timeout { duration },
+                }
+            }
+            WebRtcEvent::Transmit {
+                destination,
+                datagram,
+            } => {
+                if let Err(error) = socket.try_send_to(&datagram, destination) {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        ?source,
+                        ?error,
+                        "failed to send datagram",
+                    );
+                }
+            }
+            WebRtcEvent::ConnectionClosed => break ConnectionEvent::ConnectionClosed,
+            WebRtcEvent::ConnectionOpened {
+                peer,
+                remote_fingerprint,
+            } => {
+                break ConnectionEvent::ConnectionEstablished {
+                    peer,
+                    remote_fingerprint,
+                };
+            }
+            _ => { // noise::inbound(id_keys, stream, client_fingerprint, server_fingerprint),
+            }
+        }
+    };
+
+    let ConnectionEvent::ConnectionEstablished {
+        peer,
+        remote_fingerprint,
+    } = event
+    else {
+        return Err(Error::Disconnected);
+    };
+
+    let stream = create_substream_for_noise_handshake(&connection).await?;
+
+    let client_fingerprint: crate::tokio::Fingerprint =
+        config.dtls_cert().unwrap().fingerprint().into();
+
+    let peer_id = noise::inbound(
+        id_keys,
+        stream,
+        client_fingerprint.into(),
+        *remote_fingerprint,
+    )
+    .await?;
+
+    let peer_address = PeerAddress(source);
+    let handshake_state = HandshakeState::Opened { remote_fingerprint };
+    let connection = connection.open(OpenConfig {
+        socket,
+        peer_address,
+        dgram_rx,
+        peer,
+        handshake_state,
+    });
+    Ok((peer_id, connection))
 }
 
 /// Create RTC client and open channel for Noise handshake.
-pub fn make_rtc_client(
+pub(crate) fn make_rtc_client(
     ufrag: &str,
     pass: &str,
     source: SocketAddr,
@@ -111,4 +195,10 @@ pub fn make_rtc_client(
     });
 
     (rtc, noise_channel_id)
+}
+
+async fn create_substream_for_noise_handshake(conn: &Connection) -> Result<Stream, Error> {
+    // use Rtc to create a channel for Noise, negotiated fag set to true
+    // conn.stage.rtc().channel(id);
+    todo!()
 }

@@ -23,6 +23,7 @@ tracing = { workspace = true }
 # external dependencies
 if-watch = "3.2"
 rand = "0.8"
+send_wrapper = "0.6.0"
 socket2 = { version = "0.5.5", features = ["all"] }
 str0m = "0.5.1"
 thiserror = "1"
