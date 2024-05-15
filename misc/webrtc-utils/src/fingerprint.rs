@@ -21,7 +21,7 @@
 
 use libp2p_core::multihash;
 use sha2::Digest as _;
-use std::fmt;
+use std::{fmt, ops::Deref};
 
 pub const SHA256: &str = "sha-256";
 const MULTIHASH_SHA256_CODE: u64 = 0x12;
@@ -78,6 +78,14 @@ impl Fingerprint {
 impl fmt::Debug for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&hex::encode(self.0))
+    }
+}
+
+impl Deref for Fingerprint {
+    type Target = [u8; 32];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
