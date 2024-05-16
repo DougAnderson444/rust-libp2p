@@ -29,6 +29,8 @@ pub(crate) struct PollDataChannel {
 }
 
 impl PollDataChannel {
+    /// Create a new [`PollDataChannel`] that creates and wires up the necessary wakers to the
+    /// pollers for the given channel id.
     pub(crate) fn new(
         rtc: Arc<Mutex<Rtc>>,
         channel_id: str0m::channel::ChannelId,
@@ -48,7 +50,7 @@ impl PollDataChannel {
             .channels()
             .get_mut(&channel_id)
             .unwrap()
-            .set_waker(Waker::new(Arc::new(AtomicWaker::new())), WakerType::Open);
+            .set_wakers();
 
         Self {
             inner: rtc,

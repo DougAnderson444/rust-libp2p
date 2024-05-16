@@ -79,9 +79,16 @@ impl DataChannel {
         self.state.clone()
     }
 
-    /// Sets the Open Waker.
-    pub fn set_waker(&mut self, waker: Waker, waker_type: WakerType) {
-        self.wakers.insert(waker_type, waker);
+    /// Sets the Open Waker for each WakerType
+    pub fn set_wakers(&mut self) {
+        self.wakers
+            .insert(WakerType::NewData, Waker::new(Arc::new(AtomicWaker::new())));
+        self.wakers
+            .insert(WakerType::Open, Waker::new(Arc::new(AtomicWaker::new())));
+        self.wakers
+            .insert(WakerType::Close, Waker::new(Arc::new(AtomicWaker::new())));
+        self.wakers
+            .insert(WakerType::Write, Waker::new(Arc::new(AtomicWaker::new())));
     }
 
     /// Register the Open Waker to the given Context.
