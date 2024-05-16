@@ -11,7 +11,7 @@ use crate::tokio::UdpSocket;
 use std::{
     net::SocketAddr,
     ops::Deref,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -36,7 +36,7 @@ pub trait Connectable {
     fn recv_data(&mut self, buf: &[u8]) -> Result<(), Error>;
 
     /// Shared Rtc field
-    fn rtc(&mut self) -> &mut Rtc;
+    fn rtc(&mut self) -> &mut Arc<Mutex<Rtc>>;
 
     /// On transmit data, with associate type for the return output
     /// Handle [`str0m::Output::Transmit`] events.
@@ -151,7 +151,7 @@ pub enum ConnectionEvent {
 #[derive(Debug)]
 pub struct Opening {
     /// `str0m` WebRTC object.
-    rtc: Rtc,
+    rtc: Arc<Mutex<Rtc>>,
 
     /// TX channel for sending datagrams to the connection event loop.
     tx: Sender<Vec<u8>>,
@@ -165,7 +165,7 @@ pub struct Opening {
 
 impl Opening {
     /// Creates a new `Opening` state.
-    pub fn new(rtc: Rtc, noise_id: ChannelId) -> Self {
+    pub fn new(rtc: Arc<Mutex<Rtc>>, noise_id: ChannelId) -> Self {
         Self {
             rtc,
             tx: channel(1).0,
@@ -176,14 +176,19 @@ impl Opening {
 
     /// Handle timeouts while opening
     pub fn on_timeout(&mut self) -> Result<(), Error> {
-        if let Err(error) = self.rtc.handle_input(Input::Timeout(Instant::now())) {
+        if let Err(error) = self
+            .rtc
+            .lock()
+            .unwrap()
+            .handle_input(Input::Timeout(Instant::now()))
+        {
             tracing::error!(
                 target: LOG_TARGET,
                 ?error,
                 "failed to handle timeout for `Rtc`"
             );
 
-            self.rtc.disconnect();
+            self.rtc.lock().unwrap().disconnect();
             return Err(Error::Disconnected);
         }
 
@@ -208,7 +213,7 @@ impl Deref for PeerAddress {
 #[derive(Debug)]
 pub struct Open {
     /// `str0m` WebRTC object, moved here from Opening state.
-    rtc: Rtc,
+    rtc: Arc<Mutex<Rtc>>,
 
     // TX channel for sending datagrams to the connection event loop.
     tx: Sender<Vec<u8>>,
@@ -227,7 +232,7 @@ pub struct Open {
 impl Open {
     /// Creates a new `Open` state.
     pub fn new(
-        rtc: Rtc,
+        rtc: Arc<Mutex<Rtc>>,
         tx: Sender<Vec<u8>>,
         socket: Arc<UdpSocket>,
         peer_address: PeerAddress,
@@ -274,20 +279,27 @@ impl<Stage: Connectable> Connection<Stage> {
 
     /// Rtc Poll Output
     fn rtc_poll_output(&mut self) -> <Stage as crate::tokio::connection::Connectable>::Output {
-        let output = match self.stage.rtc().poll_output() {
-            Ok(output) => output,
-            Err(error) => {
-                tracing::debug!(
-                    target: LOG_TARGET,
-                    // connection_id = ?self.connection_id,
-                    ?error,
-                    "`Connection::rtc_poll_output()` failed",
-                );
+        let out = {
+            let mut rtc = self.stage.rtc().lock().unwrap();
+            let output = rtc.poll_output();
+            match output {
+                Ok(output) => output,
+                Err(error) => {
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        // connection_id = ?self.connection_id,
+                        ?error,
+                        "`Connection::rtc_poll_output()` failed",
+                    );
 
-                return self.stage.on_rtc_error(error);
+                    drop(rtc);
+                    let ret = self.stage.on_rtc_error(error);
+
+                    return ret;
+                }
             }
         };
-        match output {
+        match out {
             Output::Transmit(transmit) => self.stage.on_output_transmit(transmit),
             Output::Timeout(timeout) => self.stage.on_output_timeout(timeout),
             Output::Event(e) => match e {
@@ -357,7 +369,7 @@ impl Connection<Opening> {
 
     /// Progress the [`Connection`] opening process.
     pub(crate) fn poll_progress(&mut self) -> WebRtcEvent {
-        if !self.stage.rtc.is_alive() {
+        if !self.stage.rtc.lock().unwrap().is_alive() {
             tracing::debug!(
                 target: LOG_TARGET,
                 "`Rtc` is not alive, closing `WebRtcConnection`"
@@ -381,7 +393,7 @@ impl Connectable for Opening {
     type Output = WebRtcEvent;
 
     /// has Rtc field
-    fn rtc(&mut self) -> &mut Rtc {
+    fn rtc(&mut self) -> &mut Arc<Mutex<Rtc>> {
         &mut self.rtc
     }
 
@@ -474,6 +486,8 @@ impl Connectable for Opening {
             HandshakeState::Closed => {
                 let remote_fp: Fingerprint = self
                     .rtc
+                    .lock()
+                    .unwrap()
                     .direct_api()
                     .remote_dtls_fingerprint()
                     .clone()
@@ -481,7 +495,13 @@ impl Connectable for Opening {
                     .into();
                 let remote_fingerprint_mh_bytes = remote_fp.to_multihash().to_bytes();
 
-                let local_fp: Fingerprint = self.rtc.direct_api().local_dtls_fingerprint().into();
+                let local_fp: Fingerprint = self
+                    .rtc
+                    .lock()
+                    .unwrap()
+                    .direct_api()
+                    .local_dtls_fingerprint()
+                    .into();
                 let local_fp_mh_bytes = local_fp.to_multihash().to_bytes();
 
                 // let peer_id = noise::inbound(id_keys, data_channel, remote_fp, local_fp).await?;
@@ -549,7 +569,10 @@ impl Connection<Open> {
                                         },
                                     );
 
-                                    self.stage.rtc.handle_input(input).unwrap();
+                                    self.stage.rtc
+                            .lock()
+                            .unwrap()
+                            .handle_input(input).unwrap();
                                 }
                                 None => {
                                     tracing::trace!(

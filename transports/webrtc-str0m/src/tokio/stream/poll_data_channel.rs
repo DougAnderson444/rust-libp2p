@@ -9,27 +9,32 @@ use std::task::{Context, Poll};
 use futures::task::AtomicWaker;
 use futures::{AsyncRead, AsyncWrite};
 use libp2p_webrtc_utils::MAX_MSG_LEN;
+use str0m::channel::ChannelId;
 use str0m::Rtc;
 use tokio_util::bytes::BytesMut;
 
 use super::super::connection::Connection;
 
+/// [`PollDataChannel`] is a wrapper around around [`Rtc`], [`ChannelId`], and [`Connection`] which are needed to read and write, and thenit also implements [`AsyncRead`] and [`AsyncWrite`] to satify libp2p.
+// let channel = Arc::new(rtc.channel(*id).unwrap());
 #[derive(Debug, Clone)]
 pub(crate) struct PollDataChannel {
-    inner: Arc<Rtc>,
+    /// Connection.rtc_poll_output gives us incoming data
     connection: Arc<Mutex<Connection>>,
-    id: str0m::channel::ChannelId,
+    /// Rtc + ChannelId = Channel.write() for outgoing data
+    id: ChannelId,
+    inner: Arc<Mutex<Rtc>>,
 }
 
 impl PollDataChannel {
     pub(crate) fn new(
-        rtc: Rtc,
+        rtc: Arc<Mutex<Rtc>>,
         data_channel: str0m::channel::ChannelId,
-        connection: Connection,
+        connection: Arc<Mutex<Connection>>,
     ) -> Self {
         Self {
-            inner: Arc::new(rtc),
-            connection: Arc::new(Mutex::new(connection)),
+            inner: rtc,
+            connection,
             id: data_channel,
         }
     }

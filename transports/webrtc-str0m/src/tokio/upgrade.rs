@@ -14,6 +14,7 @@ use libp2p_identity as identity;
 use libp2p_webrtc_utils::noise;
 use libp2p_webrtc_utils::sdp;
 use libp2p_webrtc_utils::Fingerprint;
+use std::sync::Mutex;
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 use str0m::{
     change::DtlsCert,
@@ -56,31 +57,43 @@ pub(crate) async fn inbound(
     let (mut rtc, noise_channel_id) =
         make_rtc_client(&remote_ufrag, &remote_ufrag, source, destination, dtls_cert);
 
-    rtc.handle_input(Input::Receive(
-        Instant::now(),
-        Receive {
-            source,
-            proto: Str0mProtocol::Udp,
-            destination,
-            contents,
-        },
-    ))
-    .expect("client to handle input successfully");
+    rtc.lock()
+        .unwrap()
+        .handle_input(Input::Receive(
+            Instant::now(),
+            Receive {
+                source,
+                proto: Str0mProtocol::Udp,
+                destination,
+                contents,
+            },
+        ))
+        .expect("client to handle input successfully");
 
     // A handle to send datagrams to the UDP socket
     let (tx, dgram_rx) = sync::mpsc::channel(DATAGRAM_BUFFER_SIZE);
 
     // Open a new Connection and poll on the next event
-    let mut connection: Connection<Opening> = Connection::new(Opening::new(rtc, noise_channel_id));
+    let mut connection: Arc<Mutex<Connection<Opening>>> = Arc::new(Mutex::new(Connection::new(
+        Opening::new(Arc::clone(&rtc), noise_channel_id),
+    )));
 
     // loop until we get a Connection event
     let event = loop {
-        match connection.poll_progress() {
+        match connection
+            .lock()
+            .map_err(|error| Error::Disconnected)?
+            .poll_progress()
+        {
             WebRtcEvent::Timeout { timeout } => {
                 let duration = timeout - Instant::now();
 
                 match duration.is_zero() {
-                    true => match connection.on_timeout() {
+                    true => match connection
+                        .lock()
+                        .map_err(|error| Error::Disconnected)?
+                        .on_timeout()
+                    {
                         Ok(()) => continue,
                         Err(error) => {
                             tracing::debug!(
@@ -132,7 +145,9 @@ pub(crate) async fn inbound(
         return Err(Error::Disconnected);
     };
 
-    let stream = create_substream_for_noise_handshake(&connection).await?;
+    let stream =
+        create_substream_for_noise_handshake(rtc, &noise_channel_id, Arc::clone(&connection))
+            .await?;
 
     let client_fingerprint: crate::tokio::Fingerprint =
         config.dtls_cert().unwrap().fingerprint().into();
@@ -147,7 +162,11 @@ pub(crate) async fn inbound(
 
     let peer_address = PeerAddress(source);
     let handshake_state = HandshakeState::Opened { remote_fingerprint };
-    let connection = connection.open(OpenConfig {
+
+    let lock = Arc::try_unwrap(connection).expect("Connection Lock still has multiple owners");
+    let connection_unlocked = lock.into_inner().expect("Mutex cannot be locked");
+
+    let connection = connection_unlocked.open(OpenConfig {
         socket,
         peer_address,
         dgram_rx,
@@ -164,7 +183,7 @@ pub(crate) fn make_rtc_client(
     source: SocketAddr,
     destination: SocketAddr,
     dtls_cert: DtlsCert,
-) -> (Rtc, ChannelId) {
+) -> (Arc<Mutex<Rtc>>, ChannelId) {
     let mut rtc = Rtc::builder()
         .set_ice_lite(true)
         .set_dtls_cert(dtls_cert)
@@ -194,11 +213,16 @@ pub(crate) fn make_rtc_client(
         protocol: "".to_string(),
     });
 
-    (rtc, noise_channel_id)
+    (Arc::new(Mutex::new(rtc)), noise_channel_id)
 }
 
-async fn create_substream_for_noise_handshake(conn: &Connection) -> Result<Stream, Error> {
+async fn create_substream_for_noise_handshake(
+    mut rtc: Arc<Mutex<Rtc>>,
+    id: &ChannelId,
+    connection: Arc<Mutex<Connection>>,
+) -> Result<Stream, Error> {
     // use Rtc to create a channel for Noise, negotiated fag set to true
-    // conn.stage.rtc().channel(id);
-    todo!()
+    let (substream, drop_listener) = Stream::new(rtc, *id, connection);
+    drop(drop_listener);
+    Ok(substream)
 }

@@ -2,7 +2,7 @@ mod poll_data_channel;
 
 use std::{
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
@@ -30,12 +30,12 @@ pub(crate) type DropListener = SendWrapper<libp2p_webrtc_utils::DropListener<Pol
 
 impl Stream {
     pub(crate) fn new(
-        rtc: Rtc,
-        data_channel: ChannelId,
-        connection: Connection,
+        rtc: Arc<Mutex<Rtc>>,
+        channel_id: ChannelId,
+        connection: Arc<Mutex<Connection>>,
     ) -> (Self, DropListener) {
         let (inner, drop_listener) =
-            libp2p_webrtc_utils::Stream::new(PollDataChannel::new(rtc, data_channel, connection));
+            libp2p_webrtc_utils::Stream::new(PollDataChannel::new(rtc, channel_id, connection));
 
         (
             Self {
