@@ -27,7 +27,7 @@ send_wrapper = "0.6.0"
 socket2 = { version = "0.5.5", features = ["all"] }
 str0m = "0.5.1"
 thiserror = "1"
-tokio = { workspace = true, features = ["net"], optional = true }
+tokio = { workspace = true, features = ["net", "macros"], optional = true }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 
 [features]
