@@ -1,6 +1,7 @@
 //! The tokio module
 
 mod certificate;
+mod channel;
 mod connection;
 mod error;
 mod fingerprint;

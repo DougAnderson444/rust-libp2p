@@ -9,6 +9,7 @@ use crate::tokio::fingerprint::Fingerprint;
 use crate::tokio::UdpSocket;
 
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     ops::Deref,
     sync::{Arc, Mutex},
@@ -26,6 +27,8 @@ use tokio::sync::mpsc::{channel, Sender};
 
 use crate::tokio::Error;
 
+use super::channel::{DataChannel, RtcDataChannelState, WakerType};
+
 const LOG_TARGET: &str = "libp2p_webrtc_str0m";
 
 pub trait Connectable {
@@ -36,6 +39,9 @@ pub trait Connectable {
 
     /// Shared Rtc field
     fn rtc(&mut self) -> &mut Arc<Mutex<Rtc>>;
+
+    /// Returns the [`HandshakeState`] of the connection.
+    fn handshake_state(&self) -> HandshakeState;
 
     /// On transmit data, with associate type for the return output
     /// Handle [`str0m::Output::Transmit`] events.
@@ -94,7 +100,7 @@ pub enum WebRtcEvent {
 }
 
 /// Opening Connection state.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum HandshakeState {
     /// Connection is poisoned.
     Poisoned,
@@ -126,7 +132,7 @@ pub enum HandshakeState {
 
 /// Events received from opening connections that are handled
 /// by the [`WebRtcTransport`] event loop.
-pub enum ConnectionEvent {
+pub(crate) enum ConnectionEvent {
     /// Connection established.
     ConnectionEstablished {
         /// Remote peer ID.
@@ -147,7 +153,7 @@ pub enum ConnectionEvent {
 }
 
 /// The Opening Connection state.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Opening {
     /// `str0m` WebRTC object.
     rtc: Arc<Mutex<Rtc>>,
@@ -265,12 +271,20 @@ pub struct Connection<Stage = Opening> {
     // state: std::marker::PhantomData<Stage>,
     /// Stage goes from Opening to Open. Holds out stage-specific values.
     stage: Stage,
+
+    /// The Channels associated with the Connection
+    channels: HashMap<ChannelId, DataChannel>,
 }
 
 impl<Stage> Unpin for Connection<Stage> {}
 
 /// Implementations that apply to both [Stages].
 impl<Stage: Connectable> Connection<Stage> {
+    /// Getter for channels
+    pub fn channels(&mut self) -> &mut HashMap<ChannelId, DataChannel> {
+        &mut self.channels
+    }
+
     pub fn dgram_recv(&mut self, buf: &[u8]) -> Result<(), Error> {
         // use Open or Opening depending on the state
         self.stage.recv_data(buf)
@@ -306,7 +320,7 @@ impl<Stage: Connectable> Connection<Stage> {
                     self.stage.on_event_ice_disconnect()
                 }
                 Event::ChannelOpen(channel_id, name) => {
-                    self.stage.on_event_channel_open(channel_id, name)
+                    self.on_event_channel_open(channel_id, name)
                 }
                 Event::ChannelData(data) => self.stage.on_event_channel_data(data),
                 Event::ChannelClose(channel_id) => self.stage.on_event_channel_close(channel_id),
@@ -314,6 +328,30 @@ impl<Stage: Connectable> Connection<Stage> {
                 event => self.stage.on_event(event),
             },
         }
+    }
+
+    /// Connection level handlers for [Event::ChannelOpen], then calls the Stage specific handlers
+    /// to Opening or Open stages.
+    fn on_event_channel_open(
+        &mut self,
+        channel_id: ChannelId,
+        name: String,
+    ) -> <Stage as crate::tokio::connection::Connectable>::Output {
+        // Set the channel state to Open
+        self.channels.insert(
+            channel_id,
+            DataChannel::new(channel_id, RtcDataChannelState::Open),
+        );
+
+        // Wake the channel waker that matches this ChannelId, which will trigger the Poll in
+        // PollDataChannelto read that the RtcDataChannelState is now Open.
+        self.channels
+            .get(&channel_id)
+            .unwrap()
+            .wake(WakerType::Open);
+
+        // Call the Stage specific handler for Channel Open
+        self.stage.on_event_channel_open(channel_id, name)
     }
     // self.rtc.poll_output().map_err(|e| e.into())
 }
@@ -340,6 +378,7 @@ impl Connection<Opening> {
         Self {
             // state: std::marker::PhantomData,
             stage: opening,
+            channels: HashMap::new(),
         }
     }
 
@@ -348,6 +387,7 @@ impl Connection<Opening> {
     /// Openin> to Open moves values into the Open state.
     pub fn open(self, config: OpenConfig) -> Connection<Open> {
         Connection {
+            channels: self.channels,
             stage: Open {
                 // move the Rtc into the Open state
                 rtc: self.stage.rtc,
@@ -394,6 +434,11 @@ impl Connectable for Opening {
     /// has Rtc field
     fn rtc(&mut self) -> &mut Arc<Mutex<Rtc>> {
         &mut self.rtc
+    }
+
+    /// Returns the [`HandshakeState`] of the connection.
+    fn handshake_state(&self) -> HandshakeState {
+        self.handshake_state.clone()
     }
 
     fn on_output_transmit(&mut self, transmit: str0m::net::Transmit) -> Self::Output {
@@ -515,7 +560,7 @@ impl Connectable for Opening {
                 };
 
                 WebRtcEvent::ConnectionOpened {
-                    peer: PeerId::random(),
+                    peer: todo!(),
                     remote_fingerprint: remote_fp,
                 }
             }
@@ -533,6 +578,91 @@ impl Connectable for Opening {
     }
 
     fn on_event(&self, event: Event) -> Self::Output {
+        todo!()
+    }
+}
+
+/// Impl Connectable for Open
+impl Connectable for Open {
+    type Output = WebRtcEvent;
+
+    /// has Rtc field
+    fn rtc(&mut self) -> &mut Arc<Mutex<Rtc>> {
+        &mut self.rtc
+    }
+
+    /// Returns the [`HandshakeState`] of the connection.
+    fn handshake_state(&self) -> HandshakeState {
+        self.handshake_state.clone()
+    }
+
+    fn on_output_transmit(&mut self, transmit: str0m::net::Transmit) -> Self::Output {
+        tracing::trace!(
+            target: LOG_TARGET,
+            "transmit data",
+        );
+        WebRtcEvent::Transmit {
+            destination: transmit.destination,
+            datagram: transmit.contents,
+        }
+    }
+
+    /// Return [WebRtcEvent::ConnectionClosed] when an error occurs.
+    fn on_rtc_error(&mut self, error: str0m::RtcError) -> Self::Output {
+        tracing::error!(
+            target: LOG_TARGET,
+            ?error,
+            "WebRTC connection error",
+        );
+        WebRtcEvent::ConnectionClosed
+    }
+
+    /// Return [WebRtcEvent::Timeout] when an error occurs while [`Opening`].
+    fn on_output_timeout(&mut self, timeout: Instant) -> Self::Output {
+        WebRtcEvent::Timeout { timeout }
+    }
+
+    /// If ICE Connection State is Disconnected, return [WebRtcEvent::ConnectionClosed].
+    fn on_event_ice_disconnect(&self) -> Self::Output {
+        tracing::trace!(target: LOG_TARGET, "ice connection closed");
+        WebRtcEvent::ConnectionClosed
+    }
+
+    /// Socket received some data, process it according to Opening State.
+    /// When the [State] is [Opening], we either are getting a [StunMessage] or
+    /// some other opening data. After we usher along the data we received, we
+    /// need to poll the opening Rtc connection to see what the next event is
+    /// and react accordingly.
+    fn recv_data(&mut self, message: &[u8]) -> std::result::Result<(), crate::tokio::error::Error> {
+        self.tx.try_send(message.to_vec()).map_err(|e| e.into())
+    }
+
+    /// Progress the opening of the channel, as applicable.
+    fn on_event_channel_open(&mut self, channel_id: ChannelId, name: String) -> Self::Output {
+        tracing::trace!(
+            target: LOG_TARGET,
+            // connection_id = ?self.connection_id,
+            ?channel_id,
+            ?name,
+            "channel opened",
+        );
+
+        WebRtcEvent::None
+    }
+
+    fn on_event_channel_data(&mut self, data: ChannelData) -> Self::Output {
+        todo!()
+    }
+
+    fn on_event_channel_close(&mut self, channel_id: ChannelId) -> Self::Output {
+        todo!()
+    }
+
+    fn on_event(&self, event: Event) -> Self::Output {
+        todo!()
+    }
+
+    fn on_event_connected(&mut self) -> Self::Output {
         todo!()
     }
 }
