@@ -151,7 +151,7 @@ impl<S: Unpin + Connectable + Send + Sync> UDPManager<S> {
                         "webrtc udp socket closed",
                     );
 
-                    return Poll::Ready(UDPManagerEvent::Error(Error::IoError(error.kind())));
+                    return Poll::Ready(UDPManagerEvent::Error(Error::IoErr(error.kind())));
                 }
                 Poll::Ready(Ok(source)) => {
                     let nread = read_buf.filled().len();

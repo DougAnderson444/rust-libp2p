@@ -15,14 +15,18 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     #[error("I/O error: `{0}`")]
-    IoError(ErrorKind),
+    IoErr(ErrorKind),
+
     /// Authentication error.
     #[error("failed to authenticate peer")]
     Authentication(#[from] libp2p_noise::Error),
 
     // Invalid peer ID.
     #[error("invalid peer ID (expected {expected}, got {got})")]
-    InvalidPeerID { expected: PeerId, got: PeerId },
+    InvalidPeerID {
+        expected: Box<PeerId>,
+        got: Box<PeerId>,
+    },
 
     #[error("no active listeners, can not dial without a previous listen")]
     NoListeners,

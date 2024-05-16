@@ -16,14 +16,13 @@ use std::{
 };
 
 use libp2p_identity::PeerId;
-use libp2p_webrtc_utils::noise;
 use str0m::{
     channel::{ChannelData, ChannelId},
     net::{DatagramSend, Protocol as Str0mProtocol, Receive},
     Event, IceConnectionState, Input, Output, Rtc,
 };
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::mpsc::{channel, error::TrySendError, Sender};
+use tokio::sync::mpsc::{channel, Sender};
 
 use crate::tokio::Error;
 
@@ -96,7 +95,7 @@ pub enum WebRtcEvent {
 
 /// Opening Connection state.
 #[derive(Debug)]
-pub(crate) enum HandshakeState {
+pub enum HandshakeState {
     /// Connection is poisoned.
     Poisoned,
 
