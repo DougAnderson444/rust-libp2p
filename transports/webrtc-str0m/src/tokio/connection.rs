@@ -53,7 +53,7 @@ pub trait Connectable {
     fn on_rtc_error(&mut self, error: str0m::RtcError) -> Self::Output;
 
     /// Handle Rtc Timeout
-    fn on_output_timeout(&mut self, timeout: Instant) -> Self::Output;
+    fn on_output_timeout(&mut self, rtc: Arc<Mutex<Rtc>>, timeout: Instant) -> Self::Output;
 
     fn on_event_ice_disconnect(&self) -> Self::Output;
 
@@ -71,7 +71,7 @@ pub trait Connectable {
 
 /// WebRTC Connection Opening Events
 #[derive(Debug)]
-pub enum WebRtcEvent {
+pub enum OpeningEvent {
     /// Register timeout for the connection.
     Timeout {
         /// Timeout.
@@ -129,28 +129,6 @@ pub enum HandshakeState {
     Validating {
         // /// Noise context.
         // context: NoiseContext,
-    },
-}
-
-/// Events received from opening connections that are handled
-/// by the [`WebRtcTransport`] event loop.
-pub(crate) enum ConnectionEvent {
-    /// Connection established.
-    ConnectionEstablished {
-        /// Remote peer ID.
-        peer: PeerId,
-        remote_fingerprint: Fingerprint,
-        // // Endpoint.
-        // endpoint: Endpoint,
-    },
-
-    /// Connection to peer closed.
-    ConnectionClosed,
-
-    /// Timeout.
-    Timeout {
-        /// Timeout duration.
-        duration: Duration,
     },
 }
 
@@ -276,7 +254,6 @@ impl<Stage: Connectable> Connection<Stage> {
                 "`Rtc` is not alive, closing `WebRtcConnection`"
             );
 
-            // WebRtcEvent::ConnectionClosed or __TBD
             return self.stage.on_event_ice_disconnect();
         }
         self.rtc_poll_output()
@@ -308,7 +285,7 @@ impl<Stage: Connectable> Connection<Stage> {
             Output::Transmit(transmit) => {
                 self.stage.on_output_transmit(self.socket.clone(), transmit)
             }
-            Output::Timeout(timeout) => self.stage.on_output_timeout(timeout),
+            Output::Timeout(timeout) => self.stage.on_output_timeout(self.rtc(), timeout),
             Output::Event(e) => match e {
                 Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
                     self.stage.on_event_ice_disconnect()
@@ -436,7 +413,7 @@ impl Connection<Opening> {
 }
 
 impl Connectable for Opening {
-    type Output = WebRtcEvent;
+    type Output = OpeningEvent;
 
     /// Returns the [`HandshakeState`] of the connection.
     fn handshake_state(&self) -> HandshakeState {
@@ -452,31 +429,65 @@ impl Connectable for Opening {
             target: LOG_TARGET,
             "transmit data",
         );
-        WebRtcEvent::Transmit {
+
+        // socket().try_send_to
+        if let Err(error) = socket.try_send_to(&transmit.contents, transmit.destination) {
+            tracing::warn!(
+                target: LOG_TARGET,
+                ?error,
+                "failed to send connection<opening> datagram",
+            );
+
+            // return WebRtcEvent::ConnectionClosed; // Should we assume this?
+            return OpeningEvent::None;
+        }
+
+        OpeningEvent::Transmit {
             destination: transmit.destination,
             datagram: transmit.contents,
         }
     }
 
-    /// Return [WebRtcEvent::ConnectionClosed] when an error occurs.
+    /// Handle error for Opening connection.
     fn on_rtc_error(&mut self, error: str0m::RtcError) -> Self::Output {
         tracing::error!(
             target: LOG_TARGET,
             ?error,
             "WebRTC connection error",
         );
-        WebRtcEvent::ConnectionClosed
+        OpeningEvent::ConnectionClosed
     }
 
     /// Return [WebRtcEvent::Timeout] when an error occurs while [`Opening`].
-    fn on_output_timeout(&mut self, timeout: Instant) -> Self::Output {
-        WebRtcEvent::Timeout { timeout }
+    fn on_output_timeout(&mut self, rtc: Arc<Mutex<Rtc>>, timeout: Instant) -> Self::Output {
+        let duration = timeout - Instant::now();
+        match duration.is_zero() {
+            true => {
+                if let Err(error) = rtc
+                    .lock()
+                    .unwrap()
+                    .handle_input(Input::Timeout(Instant::now()))
+                {
+                    tracing::error!(
+                        target: LOG_TARGET,
+                        ?error,
+                        "failed to handle timeout for `Rtc`"
+                    );
+
+                    rtc.lock().unwrap().disconnect();
+                    return OpeningEvent::ConnectionClosed;
+                }
+
+                OpeningEvent::None
+            }
+            false => OpeningEvent::Timeout { timeout },
+        }
     }
 
     /// If ICE Connection State is Disconnected, return [WebRtcEvent::ConnectionClosed].
     fn on_event_ice_disconnect(&self) -> Self::Output {
         tracing::trace!(target: LOG_TARGET, "ice connection closed");
-        WebRtcEvent::ConnectionClosed
+        OpeningEvent::ConnectionClosed
     }
 
     /// Progress the opening of the channel, as applicable.
@@ -496,7 +507,7 @@ impl Connectable for Opening {
                 ?channel_id,
                 "ignoring opened channel",
             );
-            return WebRtcEvent::None;
+            return OpeningEvent::None;
         }
 
         // TODO: no expect
@@ -510,7 +521,7 @@ impl Connectable for Opening {
         // let HandshakeState::Opened {} =
         //     std::mem::replace(&mut self.handshake, HandshakeState::Opened {});
 
-        WebRtcEvent::None
+        OpeningEvent::None
     }
 
     fn on_event_channel_data(&mut self, data: ChannelData) -> Self::Output {
@@ -533,17 +544,7 @@ impl Connectable for Opening {
                     .clone()
                     .expect("fingerprint to exist")
                     .into();
-                let remote_fingerprint_mh_bytes = remote_fp.to_multihash().to_bytes();
 
-                let local_fp: Fingerprint = rtc
-                    .lock()
-                    .unwrap()
-                    .direct_api()
-                    .local_dtls_fingerprint()
-                    .into();
-                let local_fp_mh_bytes = local_fp.to_multihash().to_bytes();
-
-                // let peer_id = noise::inbound(id_keys, data_channel, remote_fp, local_fp).await?;
                 tracing::debug!(
                     target: LOG_TARGET,
                     // peer = ?self.peer_address,
@@ -554,7 +555,7 @@ impl Connectable for Opening {
                     remote_fingerprint: remote_fp,
                 };
 
-                WebRtcEvent::ConnectionOpened {
+                OpeningEvent::ConnectionOpened {
                     peer: todo!(),
                     remote_fingerprint: remote_fp,
                 }
@@ -567,7 +568,7 @@ impl Connectable for Opening {
                     "unexpected handshake state, invalid state for connection, should be closed",
                 );
 
-                return WebRtcEvent::ConnectionClosed;
+                return OpeningEvent::ConnectionClosed;
             }
         }
     }
@@ -615,7 +616,7 @@ impl Connectable for Open {
     }
 
     /// Return [`Instant`] when a timeout occurs while [`Open`].
-    fn on_output_timeout(&mut self, timeout: Instant) -> Self::Output {
+    fn on_output_timeout(&mut self, _rtc: Arc<Mutex<Rtc>>, timeout: Instant) -> Self::Output {
         Some(timeout)
     }
 

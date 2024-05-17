@@ -2,9 +2,7 @@
 
 use crate::tokio::connection::OpenConfig;
 use crate::tokio::{
-    connection::{
-        Connectable, Connection, ConnectionEvent, HandshakeState, Opening, PeerAddress, WebRtcEvent,
-    },
+    connection::{Connectable, Connection, HandshakeState, Opening, OpeningEvent},
     error::Error,
     udp_manager::UDPManager,
 };
@@ -73,72 +71,25 @@ pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
         .unwrap()
         .add_connection(source, connection.clone());
 
-    // loop until we get a Opening Connection event
-    // Because the Connection is Opening, our trait Output is implemented as WebRtcEvent.
+    // loop ove rpoll_progress(), if returns OpeningEvent::None, continue loop
+    // If retruns OpeningEvent::ConnectionOpened, break loop as assign this reslt to destrucutred {peer, remote_fingerprint}
+    // If anything other than None or ConnectionOpened, reutn Err(Error::Disconnected)
     let event = loop {
         match connection
             .lock()
             .map_err(|_| Error::LockPoisoned)?
             .poll_progress()
         {
-            WebRtcEvent::Timeout { timeout } => {
-                let duration = timeout - Instant::now();
-
-                match duration.is_zero() {
-                    true => match connection
-                        .lock()
-                        .map_err(|_| Error::LockPoisoned)?
-                        .on_timeout()
-                    {
-                        Ok(()) => continue,
-                        Err(error) => {
-                            tracing::debug!(
-                                target: LOG_TARGET,
-                                ?source,
-                                ?error,
-                                "failed to handle timeout",
-                            );
-
-                            break ConnectionEvent::ConnectionClosed;
-                        }
-                    },
-                    false => break ConnectionEvent::Timeout { duration },
-                }
+            OpeningEvent::None => {
+                continue;
             }
-            WebRtcEvent::Transmit {
-                destination,
-                datagram,
-            } => {
-                if let Err(error) = udp_manager
-                    .lock()
-                    .unwrap()
-                    .socket()
-                    .try_send_to(&datagram, destination)
-                {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        ?source,
-                        ?error,
-                        "failed to send datagram",
-                    );
-                }
-            }
-            WebRtcEvent::ConnectionClosed => break ConnectionEvent::ConnectionClosed,
-            WebRtcEvent::ConnectionOpened {
-                peer,
-                remote_fingerprint,
-            } => {
-                break ConnectionEvent::ConnectionEstablished {
-                    peer,
-                    remote_fingerprint,
-                };
-            }
-            _ => { // noise::inbound(id_keys, stream, client_fingerprint, server_fingerprint),
+            val => {
+                break val;
             }
         }
     };
 
-    let ConnectionEvent::ConnectionEstablished {
+    let OpeningEvent::ConnectionOpened {
         peer,
         remote_fingerprint,
     } = event
