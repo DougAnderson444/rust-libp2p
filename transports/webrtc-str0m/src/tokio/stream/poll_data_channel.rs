@@ -82,7 +82,9 @@ impl PollDataChannel {
                     .register_waker(cx, WakerType::Open);
                 return Poll::Pending;
             }
-            RtcDataChannelState::Closing => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+            RtcDataChannelState::Closing | RtcDataChannelState::Closed => {
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            }
             RtcDataChannelState::Open => Poll::Ready(Ok(())),
         }
     }
@@ -105,14 +107,14 @@ impl AsyncRead for PollDataChannel {
 
         // Get read_buffer
         let chid = this.channel_id;
-        let read_buffer = this.connection().channel(chid).read_buffer();
+        let read_buffer = this.connection().channel(&chid).read_buffer();
 
         let mut read_buffer = read_buffer.lock().unwrap();
 
         if read_buffer.is_empty() {
             // Register WakerType::NewData with cx.waker()
             this.connection()
-                .channel(chid)
+                .channel(&chid)
                 .register_waker(cx, WakerType::NewData);
             return Poll::Pending;
         }
@@ -140,6 +142,8 @@ impl AsyncWrite for PollDataChannel {
 
         futures::ready!(this.poll_ready(cx))?;
 
+        // TODO: Buffer data?
+
         // write data to the channel
         let rtc = this.connection().rtc();
         let mut rtc = rtc.lock().unwrap();
@@ -148,17 +152,38 @@ impl AsyncWrite for PollDataChannel {
         match channel.write(binary, buf) {
             Ok(len) => {
                 let len: usize = len;
-                Poll::Ready(Ok::<usize, io::Error>(len))
+                Poll::Ready(Ok(len))
             }
             Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        todo!()
+        // There is no write buffer to flush in str0m
+        // So we just return Ok?
+        Poll::Ready(Ok(()))
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        todo!()
+        let this = self.get_mut();
+
+        if this.ready_state() == RtcDataChannelState::Closed {
+            return Poll::Ready(Ok(()));
+        }
+
+        if this.ready_state() == RtcDataChannelState::Closing {
+            let rtc = this.connection().rtc();
+            let mut rtc = rtc.lock().unwrap();
+            rtc.direct_api().close_data_channel(this.channel_id);
+        }
+
+        let channel_id = this.channel_id.clone();
+
+        // Register WakerType::Close with cx.waker()
+        this.connection()
+            .channel(&channel_id)
+            .register_waker(cx, WakerType::Close);
+
+        Poll::Pending
     }
 }

@@ -139,11 +139,19 @@ impl DataChannel {
     pub fn read_buffer(&self) -> Arc<Mutex<BytesMut>> {
         self.read_buffer.clone()
     }
+
+    /// Sets the state of the [DataChannel].
+    pub(crate) fn set_state(&mut self, state: RtcDataChannelState) {
+        self.state = state;
+    }
 }
 
 /// Channel state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RtcDataChannelState {
+    /// Channel is closed.
+    Closed,
+
     /// Channel is closing.
     Closing,
 

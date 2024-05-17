@@ -266,10 +266,8 @@ impl<Stage: Connectable> Connection<Stage> {
     }
 
     /// Get a mutable Channel by its ID
-    pub fn channel(&mut self, channel_id: ChannelId) -> &mut DataChannel {
-        self.channels
-            .get_mut(&channel_id)
-            .expect("channel to exist")
+    pub fn channel(&mut self, channel_id: &ChannelId) -> &mut DataChannel {
+        self.channels.get_mut(channel_id).expect("channel to exist")
     }
 
     pub fn dgram_recv(&mut self, buf: &[u8]) -> Result<(), Error> {
@@ -307,37 +305,38 @@ impl<Stage: Connectable> Connection<Stage> {
                     self.stage.on_event_ice_disconnect()
                 }
                 Event::ChannelOpen(channel_id, name) => {
-                    // Set the channel state to Open
+                    // Create, save a new Channel, set the state to Open
                     self.channels.insert(
                         channel_id,
                         DataChannel::new(channel_id, RtcDataChannelState::Open),
                     );
 
-                    // Trigger read in PollDataChannel.
-                    self.channels
-                        .get(&channel_id)
-                        .unwrap()
-                        .wake(WakerType::Open);
+                    // Trigger ready in PollDataChannel.
+                    self.channel(&channel_id).wake(WakerType::Open);
 
                     // Call the Stage specific handler for Channel Open
                     self.stage.on_event_channel_open(channel_id, name)
                 }
                 Event::ChannelData(data) => {
                     // 1) data goes in the channel read_buffer for PollDataChannel
-                    self.channels
-                        .get_mut(&data.id)
-                        .unwrap()
-                        .set_read_buffer(&data);
+                    self.channel(&data.id).set_read_buffer(&data);
 
                     // 2) Wake the PollDataChannel
-                    self.channels
-                        .get(&data.id)
-                        .unwrap()
-                        .wake(WakerType::NewData);
+                    self.channel(&data.id).wake(WakerType::NewData);
 
                     self.stage.on_event_channel_data(data)
                 }
-                Event::ChannelClose(channel_id) => self.stage.on_event_channel_close(channel_id),
+                Event::ChannelClose(channel_id) => {
+                    // 1) Set the channel state to Closed
+                    self.channel(&channel_id)
+                        .set_state(RtcDataChannelState::Closed);
+
+                    // 2) Wake the PollDataChannel to actually close the channel
+                    self.channel(&channel_id).wake(WakerType::Close);
+
+                    // 3) Deal with the Stage specific handler for Channel Closed event
+                    self.stage.on_event_channel_close(channel_id)
+                }
                 Event::Connected => {
                     let rtc = Arc::clone(&self.rtc);
                     self.stage.on_event_connected(rtc)
