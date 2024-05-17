@@ -37,9 +37,6 @@ pub trait Connectable {
     /// Socket received some data, process it according to the State.
     fn recv_data(&mut self, buf: &[u8]) -> Result<(), Error>;
 
-    /// Shared Rtc field
-    fn rtc(&mut self) -> &mut Arc<Mutex<Rtc>>;
-
     /// Returns the [`HandshakeState`] of the connection.
     fn handshake_state(&self) -> HandshakeState;
 
@@ -62,7 +59,7 @@ pub trait Connectable {
 
     fn on_event_channel_close(&mut self, channel_id: ChannelId) -> Self::Output;
 
-    fn on_event_connected(&mut self) -> Self::Output;
+    fn on_event_connected(&mut self, rtc: Arc<Mutex<Rtc>>) -> Self::Output;
 
     fn on_event(&self, event: Event) -> Self::Output;
 }
@@ -155,9 +152,6 @@ pub(crate) enum ConnectionEvent {
 /// The Opening Connection state.
 #[derive(Debug, Clone)]
 pub struct Opening {
-    /// `str0m` WebRTC object.
-    rtc: Arc<Mutex<Rtc>>,
-
     /// TX channel for sending datagrams to the connection event loop.
     tx: Sender<Vec<u8>>,
 
@@ -170,33 +164,16 @@ pub struct Opening {
 
 impl Opening {
     /// Creates a new `Opening` state.
-    pub fn new(rtc: Arc<Mutex<Rtc>>, noise_id: ChannelId) -> Self {
+    pub fn new(noise_channel_id: ChannelId) -> Self {
         Self {
-            rtc,
             tx: channel(1).0,
-            noise_channel_id: noise_id,
+            noise_channel_id,
             handshake_state: HandshakeState::Closed,
         }
     }
 
     /// Handle timeouts while opening
     pub fn on_timeout(&mut self) -> Result<(), Error> {
-        if let Err(error) = self
-            .rtc
-            .lock()
-            .unwrap()
-            .handle_input(Input::Timeout(Instant::now()))
-        {
-            tracing::error!(
-                target: LOG_TARGET,
-                ?error,
-                "failed to handle timeout for `Rtc`"
-            );
-
-            self.rtc.lock().unwrap().disconnect();
-            return Err(Error::Disconnected);
-        }
-
         Ok(())
     }
 }
@@ -217,9 +194,6 @@ impl Deref for PeerAddress {
 /// The Open Connection state.
 #[derive(Debug)]
 pub struct Open {
-    /// `str0m` WebRTC object, moved here from Opening state.
-    rtc: Arc<Mutex<Rtc>>,
-
     // TX channel for sending datagrams to the connection event loop.
     tx: Sender<Vec<u8>>,
     /// Peer address Newtype
@@ -237,7 +211,6 @@ pub struct Open {
 impl Open {
     /// Creates a new `Open` state.
     pub fn new(
-        rtc: Arc<Mutex<Rtc>>,
         tx: Sender<Vec<u8>>,
         socket: Arc<UdpSocket>,
         peer_address: PeerAddress,
@@ -246,7 +219,6 @@ impl Open {
         handshake_state: HandshakeState,
     ) -> Self {
         Self {
-            rtc,
             tx,
             socket,
             dgram_rx,
@@ -274,6 +246,9 @@ pub struct Connection<Stage = Opening> {
 
     /// The Channels associated with the Connection
     channels: HashMap<ChannelId, DataChannel>,
+
+    /// Rtc object associated with the connection.
+    rtc: Arc<Mutex<Rtc>>,
 }
 
 impl<Stage> Unpin for Connection<Stage> {}
@@ -300,7 +275,7 @@ impl<Stage: Connectable> Connection<Stage> {
     /// Rtc Poll Output
     fn rtc_poll_output(&mut self) -> <Stage as crate::tokio::connection::Connectable>::Output {
         let out = {
-            let mut rtc = self.stage.rtc().lock().unwrap();
+            let mut rtc = self.rtc.lock().unwrap();
             let output = rtc.poll_output();
             match output {
                 Ok(output) => output,
@@ -358,7 +333,10 @@ impl<Stage: Connectable> Connection<Stage> {
                     self.stage.on_event_channel_data(data)
                 }
                 Event::ChannelClose(channel_id) => self.stage.on_event_channel_close(channel_id),
-                Event::Connected => self.stage.on_event_connected(),
+                Event::Connected => {
+                    let rtc = Arc::clone(&self.rtc);
+                    self.stage.on_event_connected(rtc)
+                }
                 event => self.stage.on_event(event),
             },
         }
@@ -383,9 +361,9 @@ pub struct OpenConfig {
 /// Implementations that apply only to the Opening Connection state.
 impl Connection<Opening> {
     /// Creates a new `Connection` in the Opening state.
-    pub fn new(opening: Opening) -> Self {
+    pub fn new(rtc: Arc<Mutex<Rtc>>, opening: Opening) -> Self {
         Self {
-            // state: std::marker::PhantomData,
+            rtc,
             stage: opening,
             channels: HashMap::new(),
         }
@@ -396,10 +374,9 @@ impl Connection<Opening> {
     /// Openin> to Open moves values into the Open state.
     pub fn open(self, config: OpenConfig) -> Connection<Open> {
         Connection {
+            rtc: self.rtc,
             channels: self.channels,
             stage: Open {
-                // move the Rtc into the Open state
-                rtc: self.stage.rtc,
                 tx: self.stage.tx,
                 socket: config.socket,
                 dgram_rx: config.dgram_rx,
@@ -412,12 +389,28 @@ impl Connection<Opening> {
 
     /// Handle timeout
     pub fn on_timeout(&mut self) -> Result<(), Error> {
-        self.stage.on_timeout()
+        if let Err(error) = self
+            .rtc
+            .lock()
+            .unwrap()
+            .handle_input(Input::Timeout(Instant::now()))
+        {
+            tracing::error!(
+                target: LOG_TARGET,
+                ?error,
+                "failed to handle timeout for `Rtc`"
+            );
+
+            self.rtc.lock().unwrap().disconnect();
+            return Err(Error::Disconnected);
+        }
+
+        Ok(())
     }
 
     /// Progress the [`Connection`] opening process.
     pub(crate) fn poll_progress(&mut self) -> WebRtcEvent {
-        if !self.stage.rtc.lock().unwrap().is_alive() {
+        if !self.rtc.lock().unwrap().is_alive() {
             tracing::debug!(
                 target: LOG_TARGET,
                 "`Rtc` is not alive, closing `WebRtcConnection`"
@@ -439,11 +432,6 @@ impl Connection<Opening> {
 
 impl Connectable for Opening {
     type Output = WebRtcEvent;
-
-    /// has Rtc field
-    fn rtc(&mut self) -> &mut Arc<Mutex<Rtc>> {
-        &mut self.rtc
-    }
 
     /// Returns the [`HandshakeState`] of the connection.
     fn handshake_state(&self) -> HandshakeState {
@@ -533,12 +521,11 @@ impl Connectable for Opening {
         todo!()
     }
 
-    fn on_event_connected(&mut self) -> Self::Output {
+    fn on_event_connected(&mut self, rtc: Arc<Mutex<Rtc>>) -> Self::Output {
         match std::mem::replace(&mut self.handshake_state, HandshakeState::Poisoned) {
             // Initial State should be Closed before we connect
             HandshakeState::Closed => {
-                let remote_fp: Fingerprint = self
-                    .rtc
+                let remote_fp: Fingerprint = rtc
                     .lock()
                     .unwrap()
                     .direct_api()
@@ -548,8 +535,7 @@ impl Connectable for Opening {
                     .into();
                 let remote_fingerprint_mh_bytes = remote_fp.to_multihash().to_bytes();
 
-                let local_fp: Fingerprint = self
-                    .rtc
+                let local_fp: Fingerprint = rtc
                     .lock()
                     .unwrap()
                     .direct_api()
@@ -594,11 +580,6 @@ impl Connectable for Opening {
 /// Impl Connectable for Open
 impl Connectable for Open {
     type Output = WebRtcEvent;
-
-    /// has Rtc field
-    fn rtc(&mut self) -> &mut Arc<Mutex<Rtc>> {
-        &mut self.rtc
-    }
 
     /// Returns the [`HandshakeState`] of the connection.
     fn handshake_state(&self) -> HandshakeState {
@@ -671,7 +652,7 @@ impl Connectable for Open {
         todo!()
     }
 
-    fn on_event_connected(&mut self) -> Self::Output {
+    fn on_event_connected(&mut self, rtc: Arc<Mutex<Rtc>>) -> Self::Output {
         todo!()
     }
 }
@@ -707,7 +688,7 @@ impl Connection<Open> {
                                         },
                                     );
 
-                                    self.stage.rtc
+                                    self.rtc
                             .lock()
                             .unwrap()
                             .handle_input(input).unwrap();

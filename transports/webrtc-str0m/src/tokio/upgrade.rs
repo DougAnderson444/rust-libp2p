@@ -75,7 +75,8 @@ pub(crate) async fn inbound(
 
     // Open a new Connection and poll on the next event
     let mut connection: Arc<Mutex<Connection<Opening>>> = Arc::new(Mutex::new(Connection::new(
-        Opening::new(Arc::clone(&rtc), noise_channel_id),
+        rtc,
+        Opening::new(noise_channel_id),
     )));
 
     // loop until we get a Connection event
