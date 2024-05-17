@@ -22,8 +22,8 @@ use str0m::{
     net::{DatagramSend, Protocol as Str0mProtocol, Receive},
     Event, IceConnectionState, Input, Output, Rtc,
 };
+use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::{self, Receiver};
-use tokio::sync::mpsc::{channel, Sender};
 
 use crate::tokio::Error;
 
@@ -191,10 +191,6 @@ impl Deref for PeerAddress {
 /// The Open Connection state.
 #[derive(Debug)]
 pub struct Open {
-    /// Peer address Newtype
-    peer_address: PeerAddress,
-    /// Transport socket.
-    socket: Arc<UdpSocket>,
     /// Remote peer ID.
     peer: PeerId,
     /// The state of the opening connection handshake
@@ -203,15 +199,8 @@ pub struct Open {
 
 impl Open {
     /// Creates a new `Open` state.
-    pub fn new(
-        socket: Arc<UdpSocket>,
-        peer_address: PeerAddress,
-        peer: PeerId,
-        handshake_state: HandshakeState,
-    ) -> Self {
+    pub fn new(peer: PeerId, handshake_state: HandshakeState) -> Self {
         Self {
-            socket,
-            peer_address,
             peer,
             handshake_state,
         }
@@ -225,6 +214,9 @@ pub struct Connection<Stage = Opening> {
     /// Stage goes from Opening to Open. Holds out stage-specific values.
     stage: Stage,
 
+    /// Transport socket.
+    socket: Arc<UdpSocket>,
+
     /// The Channels associated with the Connection
     channels: HashMap<ChannelId, DataChannel>,
 
@@ -236,6 +228,12 @@ pub struct Connection<Stage = Opening> {
 
     /// RX channel for receiving datagrams from the transport.
     dgram_rx: Receiver<Vec<u8>>,
+
+    /// Peer address Newtype
+    peer_address: PeerAddress,
+
+    /// This peer's local address.
+    local_address: SocketAddr,
 }
 
 impl<Stage> Unpin for Connection<Stage> {}
@@ -361,22 +359,29 @@ pub struct OpenConfig {
     pub peer: PeerId,
     /// The state of the opening connection handshake
     pub handshake_state: HandshakeState,
-    /// The Peer Socket Address
-    pub peer_address: PeerAddress,
 }
 
 /// Implementations that apply only to the Opening Connection state.
 impl Connection<Opening> {
     /// Creates a new `Connection` in the Opening state.
-    pub fn new(rtc: Arc<Mutex<Rtc>>, opening: Opening) -> Self {
+    pub fn new(
+        rtc: Arc<Mutex<Rtc>>,
+        socket: Arc<UdpSocket>,
+        source: SocketAddr,
+        opening: Opening,
+    ) -> Self {
         // Create a channel for sending datagrams to the connection event handler.
         let (relay_dgram, dgram_rx) = mpsc::channel(DATAGRAM_BUFFER_SIZE);
+        let local_address = socket.local_addr().unwrap();
         Self {
             rtc,
+            socket,
             stage: opening,
             channels: HashMap::new(),
             relay_dgram,
             dgram_rx,
+            peer_address: PeerAddress(source),
+            local_address,
         }
     }
 
@@ -389,9 +394,10 @@ impl Connection<Opening> {
             channels: self.channels,
             relay_dgram: self.relay_dgram,
             dgram_rx: self.dgram_rx,
+            peer_address: self.peer_address,
+            local_address: self.local_address,
+            socket: self.socket,
             stage: Open {
-                socket: config.socket,
-                peer_address: config.peer_address,
                 peer: config.peer,
                 handshake_state: config.handshake_state,
             },
@@ -642,7 +648,8 @@ impl Connection<Open> {
         // TODO: Report Connection Closed
     }
 
-    /// Runs the connection loop to deal with Transmission and Events
+    /// Runs the main str0m input handler
+    /// which is a connection loop to deal with Transmission and Events
     pub async fn run(&mut self) {
         loop {
             // Do something
@@ -654,8 +661,8 @@ impl Connection<Open> {
                                         Instant::now(),
                                         Receive {
                                             proto: Str0mProtocol::Udp,
-                                            source: *self.stage.peer_address,
-                                            destination: self.stage.socket.local_addr().unwrap(),
+                                            source: *self.peer_address,
+                                            destination: self.local_address,
                                             contents: datagram.as_slice().try_into().unwrap(),
                                         },
                                     );

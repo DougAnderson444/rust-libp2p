@@ -1,5 +1,6 @@
 use libp2p_identity::PeerId;
 use std::io::{self, ErrorKind};
+use std::sync::PoisonError;
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -56,4 +57,8 @@ pub enum Error {
     /// Nonexistant Channel Id
     #[error("channel doesn't exist")]
     ChannelDoesntExist,
+
+    /// Lock poisoned
+    #[error("lock poisoned")]
+    LockPoisoned,
 }

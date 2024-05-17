@@ -29,6 +29,7 @@ use crate::tokio::fingerprint::Fingerprint;
 use crate::tokio::udp_manager::{UDPManager, UDPManagerEvent};
 
 use super::connection::{Connectable, Open};
+use super::udp_manager::NewRemoteAddress;
 use super::upgrade;
 
 /// A WebRTC transport with direct p2p communication (without a STUN server).
@@ -267,6 +268,9 @@ impl<S: Unpin + Connectable + Send + Sync> ListenStream<S> {
 
         socketaddr_to_multiaddr(&socket_addr, Some(self.config.fingerprint))
     }
+
+    /// Upgrades this incound remote source
+    fn upgrade_inbound(&self, remote: NewRemoteAddress) {}
 }
 
 impl<S: 'static + Unpin + Connectable + Send + Sync> Stream for ListenStream<S> {
@@ -291,22 +295,25 @@ impl<S: 'static + Unpin + Connectable + Send + Sync> Stream for ListenStream<S> 
                 return Poll::Ready(Some(event));
             }
 
-            let mut udp = self.udp_manager.lock().unwrap();
+            let mut manager = self.udp_manager.lock().unwrap();
 
-            match udp.poll(cx) {
-                Poll::Ready(UDPManagerEvent::NewRemoteAddress(new_addr)) => {
+            // UDP Manager will only bubble up new addresses for tracking, and
+            // errors for closing. All other UDP Events are handled internally
+            // within the upgraded connection.
+            match manager.poll(cx) {
+                Poll::Ready(UDPManagerEvent::NewRemoteAddress(remote)) => {
                     let local_addr =
                         socketaddr_to_multiaddr(&self.listen_addr, Some(self.config.fingerprint));
-                    let send_back_addr = socketaddr_to_multiaddr(&new_addr.addr, None);
+                    let send_back_addr = socketaddr_to_multiaddr(&remote.addr, None);
 
                     let upgrade = upgrade::inbound(
-                        new_addr.addr,
+                        remote.addr,
                         self.config.inner.clone(),
                         self.udp_manager.clone(),
                         self.config.inner.dtls_cert().unwrap().clone(),
-                        new_addr.ufrag,
+                        remote.ufrag,
                         self.config.id_keys.clone(),
-                        new_addr.stun_msg,
+                        remote.stun_msg,
                     )
                     .boxed();
 
@@ -319,7 +326,7 @@ impl<S: 'static + Unpin + Connectable + Send + Sync> Stream for ListenStream<S> 
                 }
                 Poll::Ready(UDPManagerEvent::Error(err)) => {
                     tracing::error!("Error in UDPManager: {:?}", err);
-                    drop(udp);
+                    drop(manager);
                     self.close(Err(err));
                     continue;
                 }

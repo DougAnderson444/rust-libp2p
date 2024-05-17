@@ -11,22 +11,13 @@ use libp2p_identity::PeerId;
 use socket2::{Domain, Socket, Type};
 use std::sync::Arc;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
-    time::Instant,
 };
-use str0m::{
-    ice::{IceCreds, StunMessage},
-    net::{DatagramRecv, Receive},
-    Input,
-};
-use tokio::{
-    io::ReadBuf,
-    net::UdpSocket,
-    sync::mpsc::{channel, error::TrySendError, Sender},
-};
+use str0m::ice::{IceCreds, StunMessage};
+use tokio::{io::ReadBuf, net::UdpSocket, sync::mpsc::Sender};
 
 /// Logging target for the file.
 const LOG_TARGET: &str = "libp2p_webrtc_str0m";

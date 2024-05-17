@@ -1,7 +1,6 @@
 //! Upgrades new connections with Noise Protocol.
 
 use crate::tokio::connection::OpenConfig;
-use crate::tokio::UdpSocket;
 use crate::tokio::{
     connection::{
         Connectable, Connection, ConnectionEvent, HandshakeState, Opening, PeerAddress, WebRtcEvent,
@@ -12,7 +11,6 @@ use crate::tokio::{
 use identity::PeerId;
 use libp2p_identity as identity;
 use libp2p_webrtc_utils::noise;
-use libp2p_webrtc_utils::sdp;
 use libp2p_webrtc_utils::Fingerprint;
 use std::sync::Mutex;
 use std::{net::SocketAddr, sync::Arc, time::Instant};
@@ -23,13 +21,9 @@ use str0m::{
     IceCreds, Input, Rtc, RtcConfig,
 };
 use str0m::{net::Protocol as Str0mProtocol, Candidate};
-use tokio::sync;
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::{connection::Open, fingerprint, stream::Stream};
-
-/// The size of the buffer for incoming datagrams.
-const DATAGRAM_BUFFER_SIZE: usize = 1024;
 
 /// The log target for this module.
 const LOG_TARGET: &str = "libp2p_webrtc_str0m";
@@ -58,9 +52,18 @@ pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
     let contents: DatagramRecv = contents.as_slice().try_into().unwrap();
 
     // create new `Rtc` object for the peer and give it the received STUN message
-    let (mut rtc, noise_channel_id) =
+    let (rtc, noise_channel_id) =
         make_rtc_client(&remote_ufrag, &remote_ufrag, source, destination, dtls_cert);
 
+    // Open a new Connection and poll on the next event
+    let connection: Arc<Mutex<Connection<Opening>>> = Arc::new(Mutex::new(Connection::new(
+        rtc.clone(),
+        udp_manager.lock().unwrap().socket(),
+        source,
+        Opening::new(noise_channel_id),
+    )));
+
+    // This *should* be done through connection<opening>
     rtc.lock()
         .unwrap()
         .handle_input(Input::Receive(
@@ -74,12 +77,6 @@ pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
         ))
         .expect("client to handle input successfully");
 
-    // Open a new Connection and poll on the next event
-    let mut connection: Arc<Mutex<Connection<Opening>>> = Arc::new(Mutex::new(Connection::new(
-        rtc,
-        Opening::new(noise_channel_id),
-    )));
-
     // This new Connection needs to be added to udp_manager.addr_conns
 
     // loop until we get a Opening Connection event
@@ -87,7 +84,7 @@ pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
     let event = loop {
         match connection
             .lock()
-            .map_err(|error| Error::Disconnected)?
+            .map_err(|_| Error::LockPoisoned)?
             .poll_progress()
         {
             WebRtcEvent::Timeout { timeout } => {
@@ -96,7 +93,7 @@ pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
                 match duration.is_zero() {
                     true => match connection
                         .lock()
-                        .map_err(|error| Error::Disconnected)?
+                        .map_err(|_| Error::LockPoisoned)?
                         .on_timeout()
                     {
                         Ok(()) => continue,
@@ -170,17 +167,15 @@ pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
     )
     .await?;
 
-    let peer_address = PeerAddress(source);
     let handshake_state = HandshakeState::Opened { remote_fingerprint };
 
     let lock = Arc::try_unwrap(connection).expect("Connection Lock still has multiple owners");
-    let connection_unlocked = lock.into_inner().expect("Mutex cannot be locked");
+    let connection = lock.into_inner().expect("Mutex cannot be locked");
 
     let socket = udp_manager.lock().unwrap().socket().clone();
 
-    let connection = Arc::new(AsyncMutex::new(connection_unlocked.open(OpenConfig {
+    let connection = Arc::new(AsyncMutex::new(connection.open(OpenConfig {
         socket,
-        peer_address,
         peer,
         handshake_state,
     })));
