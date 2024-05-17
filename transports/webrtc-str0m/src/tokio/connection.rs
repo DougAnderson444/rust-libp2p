@@ -261,7 +261,7 @@ impl Open {
         &self,
         message: Vec<u8>,
     ) -> Result<(), tokio::sync::mpsc::error::TrySendError<Vec<u8>>> {
-        Ok(self.tx.try_send(message)?)
+        self.tx.try_send(message)
     }
 }
 
@@ -280,9 +280,16 @@ impl<Stage> Unpin for Connection<Stage> {}
 
 /// Implementations that apply to both [Stages].
 impl<Stage: Connectable> Connection<Stage> {
-    /// Getter for channels
+    /// Getter for all channels
     pub fn channels(&mut self) -> &mut HashMap<ChannelId, DataChannel> {
         &mut self.channels
+    }
+
+    /// Get a mutable Channel by its ID
+    pub fn channel(&mut self, channel_id: ChannelId) -> &mut DataChannel {
+        self.channels
+            .get_mut(&channel_id)
+            .expect("channel to exist")
     }
 
     pub fn dgram_recv(&mut self, buf: &[u8]) -> Result<(), Error> {
@@ -320,40 +327,42 @@ impl<Stage: Connectable> Connection<Stage> {
                     self.stage.on_event_ice_disconnect()
                 }
                 Event::ChannelOpen(channel_id, name) => {
-                    self.on_event_channel_open(channel_id, name)
+                    // Set the channel state to Open
+                    self.channels.insert(
+                        channel_id,
+                        DataChannel::new(channel_id, RtcDataChannelState::Open),
+                    );
+
+                    // Trigger read in PollDataChannel.
+                    self.channels
+                        .get(&channel_id)
+                        .unwrap()
+                        .wake(WakerType::Open);
+
+                    // Call the Stage specific handler for Channel Open
+                    self.stage.on_event_channel_open(channel_id, name)
                 }
-                Event::ChannelData(data) => self.stage.on_event_channel_data(data),
+                Event::ChannelData(data) => {
+                    // 1) data goes in the channel read_buffer for PollDataChannel
+                    self.channels
+                        .get_mut(&data.id)
+                        .unwrap()
+                        .set_read_buffer(&data);
+
+                    // 2) Wake the PollDataChannel
+                    self.channels
+                        .get(&data.id)
+                        .unwrap()
+                        .wake(WakerType::NewData);
+
+                    self.stage.on_event_channel_data(data)
+                }
                 Event::ChannelClose(channel_id) => self.stage.on_event_channel_close(channel_id),
                 Event::Connected => self.stage.on_event_connected(),
                 event => self.stage.on_event(event),
             },
         }
     }
-
-    /// Connection level handlers for [Event::ChannelOpen], then calls the Stage specific handlers
-    /// to Opening or Open stages.
-    fn on_event_channel_open(
-        &mut self,
-        channel_id: ChannelId,
-        name: String,
-    ) -> <Stage as crate::tokio::connection::Connectable>::Output {
-        // Set the channel state to Open
-        self.channels.insert(
-            channel_id,
-            DataChannel::new(channel_id, RtcDataChannelState::Open),
-        );
-
-        // Wake the channel waker that matches this ChannelId, which will trigger the Poll in
-        // PollDataChannelto read that the RtcDataChannelState is now Open.
-        self.channels
-            .get(&channel_id)
-            .unwrap()
-            .wake(WakerType::Open);
-
-        // Call the Stage specific handler for Channel Open
-        self.stage.on_event_channel_open(channel_id, name)
-    }
-    // self.rtc.poll_output().map_err(|e| e.into())
 }
 
 /// Configure the Open stage:

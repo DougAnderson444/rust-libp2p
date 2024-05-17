@@ -146,8 +146,7 @@ pub(crate) async fn inbound(
     };
 
     let stream =
-        create_substream_for_noise_handshake(rtc, &noise_channel_id, Arc::clone(&connection))
-            .await?;
+        create_substream_for_noise_handshake(&noise_channel_id, Arc::clone(&connection)).await?;
 
     let client_fingerprint: crate::tokio::Fingerprint =
         config.dtls_cert().unwrap().fingerprint().into();
@@ -217,12 +216,11 @@ pub(crate) fn make_rtc_client(
 }
 
 async fn create_substream_for_noise_handshake(
-    mut rtc: Arc<Mutex<Rtc>>,
     id: &ChannelId,
     connection: Arc<Mutex<Connection>>,
 ) -> Result<Stream, Error> {
     // use Rtc to create a channel for Noise, negotiated fag set to true
-    let (substream, drop_listener) = Stream::new(rtc, *id, connection);
+    let (substream, drop_listener) = Stream::new(*id, connection)?;
     drop(drop_listener);
     Ok(substream)
 }

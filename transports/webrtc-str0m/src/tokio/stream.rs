@@ -16,7 +16,7 @@ use str0m::{
 };
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
-use super::Connection;
+use super::{Connection, Error};
 
 /// A substream on top of a WebRTC data channel.
 ///
@@ -30,19 +30,18 @@ pub(crate) type DropListener = SendWrapper<libp2p_webrtc_utils::DropListener<Pol
 
 impl Stream {
     pub(crate) fn new(
-        rtc: Arc<Mutex<Rtc>>,
         channel_id: ChannelId,
         connection: Arc<Mutex<Connection>>,
-    ) -> (Self, DropListener) {
+    ) -> Result<(Self, DropListener), Error> {
         let (inner, drop_listener) =
-            libp2p_webrtc_utils::Stream::new(PollDataChannel::new(rtc, channel_id, connection));
+            libp2p_webrtc_utils::Stream::new(PollDataChannel::new(channel_id, connection)?);
 
-        (
+        Ok((
             Self {
                 inner, // : SendWrapper::new(inner),
             },
             SendWrapper::new(drop_listener),
-        )
+        ))
     }
 }
 

@@ -52,4 +52,8 @@ pub enum Error {
     /// Disconnected while Opening
     #[error("disconnected while opening")]
     Disconnected,
+
+    /// Nonexistant Channel Id
+    #[error("channel doesn't exist")]
+    ChannelDoesntExist,
 }

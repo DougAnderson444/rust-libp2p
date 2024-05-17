@@ -3,7 +3,7 @@ use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
 use futures::task::AtomicWaker;
@@ -13,29 +13,27 @@ use str0m::channel::ChannelId;
 use str0m::Rtc;
 use tokio_util::bytes::BytesMut;
 
-use crate::tokio::channel::{RtcDataChannelState, Waker, WakerType};
-
 use super::super::connection::Connection;
+use crate::tokio::channel::{RtcDataChannelState, Waker, WakerType};
+use crate::tokio::Error;
 
 /// [`PollDataChannel`] is a wrapper around around [`Rtc`], [`ChannelId`], and [`Connection`] which are needed to read and write, and thenit also implements [`AsyncRead`] and [`AsyncWrite`] to satify libp2p.
-// let channel = Arc::new(rtc.channel(*id).unwrap());
+// let channel = Arc::new(rtc.channel(*id).unwrap()).unwrap().write(data)
 #[derive(Debug, Clone)]
 pub(crate) struct PollDataChannel {
     /// Connection.rtc_poll_output gives us incoming data
     connection: Arc<Mutex<Connection>>,
     /// Rtc + ChannelId = Channel.write() for outgoing data
     channel_id: ChannelId,
-    inner: Arc<Mutex<Rtc>>,
 }
 
 impl PollDataChannel {
     /// Create a new [`PollDataChannel`] that creates and wires up the necessary wakers to the
     /// pollers for the given channel id.
     pub(crate) fn new(
-        rtc: Arc<Mutex<Rtc>>,
         channel_id: str0m::channel::ChannelId,
         connection: Arc<Mutex<Connection>>,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         // The constructor sets up this channel to monitor:
         // - When the channel is ready to read or write
         // - Wake when then is new data to read
@@ -49,14 +47,13 @@ impl PollDataChannel {
             .unwrap()
             .channels()
             .get_mut(&channel_id)
-            .unwrap()
+            .ok_or(Error::ChannelDoesntExist)?
             .set_wakers();
 
-        Self {
-            inner: rtc,
+        Ok(Self {
             connection,
             channel_id,
-        }
+        })
     }
 
     /// Returns the [RtcDataChannelState] of the [RtcDataChannel]
@@ -89,6 +86,11 @@ impl PollDataChannel {
             RtcDataChannelState::Open => Poll::Ready(Ok(())),
         }
     }
+
+    /// Get this mutable connection
+    fn connection(&mut self) -> MutexGuard<Connection> {
+        self.connection.lock().unwrap()
+    }
 }
 
 impl AsyncRead for PollDataChannel {
@@ -101,7 +103,30 @@ impl AsyncRead for PollDataChannel {
 
         futures::ready!(this.poll_ready(cx))?;
 
-        todo!()
+        // Get read_buffer
+        let chid = this.channel_id;
+        let read_buffer = this.connection().channel(chid).read_buffer();
+
+        let mut read_buffer = read_buffer.lock().unwrap();
+
+        if read_buffer.is_empty() {
+            // Register WakerType::NewData with cx.waker()
+            this.connection()
+                .channel(chid)
+                .register_waker(cx, WakerType::NewData);
+            return Poll::Pending;
+        }
+
+        // Ensure that we:
+        // - at most return what the caller can read (`buf.len()`)
+        // - at most what we have (`read_buffer.len()`)
+        let split_index = min(buf.len(), read_buffer.len());
+
+        let bytes_to_return = read_buffer.split_to(split_index);
+        let len = bytes_to_return.len();
+        buf[..len].copy_from_slice(&bytes_to_return);
+
+        Poll::Ready(Ok(len))
     }
 }
 
