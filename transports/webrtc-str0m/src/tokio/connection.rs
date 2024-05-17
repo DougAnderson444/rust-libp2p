@@ -22,20 +22,21 @@ use str0m::{
     net::{DatagramSend, Protocol as Str0mProtocol, Receive},
     Event, IceConnectionState, Input, Output, Rtc,
 };
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{self, Receiver};
 use tokio::sync::mpsc::{channel, Sender};
 
 use crate::tokio::Error;
 
 use super::channel::{DataChannel, RtcDataChannelState, WakerType};
 
+/// The size of the buffer for incoming datagrams.
+const DATAGRAM_BUFFER_SIZE: usize = 1024;
+
+/// The log target for this module.
 const LOG_TARGET: &str = "libp2p_webrtc_str0m";
 
 pub trait Connectable {
     type Output;
-
-    /// Socket received some data, process it according to the State.
-    fn recv_data(&mut self, buf: &[u8]) -> Result<(), Error>;
 
     /// Returns the [`HandshakeState`] of the connection.
     fn handshake_state(&self) -> HandshakeState;
@@ -152,9 +153,6 @@ pub(crate) enum ConnectionEvent {
 /// The Opening Connection state.
 #[derive(Debug, Clone)]
 pub struct Opening {
-    /// TX channel for sending datagrams to the connection event loop.
-    tx: Sender<Vec<u8>>,
-
     /// The Noise Channel Id
     noise_channel_id: ChannelId,
 
@@ -166,7 +164,6 @@ impl Opening {
     /// Creates a new `Opening` state.
     pub fn new(noise_channel_id: ChannelId) -> Self {
         Self {
-            tx: channel(1).0,
             noise_channel_id,
             handshake_state: HandshakeState::Closed,
         }
@@ -194,8 +191,6 @@ impl Deref for PeerAddress {
 /// The Open Connection state.
 #[derive(Debug)]
 pub struct Open {
-    // TX channel for sending datagrams to the connection event loop.
-    tx: Sender<Vec<u8>>,
     /// Peer address Newtype
     peer_address: PeerAddress,
     /// Transport socket.
@@ -211,7 +206,6 @@ pub struct Open {
 impl Open {
     /// Creates a new `Open` state.
     pub fn new(
-        tx: Sender<Vec<u8>>,
         socket: Arc<UdpSocket>,
         peer_address: PeerAddress,
         dgram_rx: Receiver<Vec<u8>>,
@@ -219,21 +213,12 @@ impl Open {
         handshake_state: HandshakeState,
     ) -> Self {
         Self {
-            tx,
             socket,
             dgram_rx,
             peer_address,
             peer,
             handshake_state,
         }
-    }
-
-    /// Try to send buffer data over the channel to the dgram_rx.
-    pub(crate) fn try_send<S: Unpin>(
-        &self,
-        message: Vec<u8>,
-    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<Vec<u8>>> {
-        self.tx.try_send(message)
     }
 }
 
@@ -249,6 +234,12 @@ pub struct Connection<Stage = Opening> {
 
     /// Rtc object associated with the connection.
     rtc: Arc<Mutex<Rtc>>,
+
+    /// TX channel for passing along received datagrams by relaying them to the connection event handler.
+    relay_dgram: Sender<Vec<u8>>,
+
+    /// RX channel for receiving datagrams from the transport.
+    dgram_rx: Receiver<Vec<u8>>,
 }
 
 impl<Stage> Unpin for Connection<Stage> {}
@@ -270,9 +261,27 @@ impl<Stage: Connectable> Connection<Stage> {
         self.channels.get_mut(channel_id).expect("channel to exist")
     }
 
+    /// Receive a datagram from the socket and process it according to the stage of the connection.
     pub fn dgram_recv(&mut self, buf: &[u8]) -> Result<(), Error> {
         // use Open or Opening depending on the state
-        self.stage.recv_data(buf)
+        Ok(self.relay_dgram.try_send(buf.to_vec())?)
+    }
+
+    /// Progress the [`Connection`] opening process.
+    /// <Stage as ::tokio::connection::Connectable>::Output
+    pub(crate) fn poll_progress(
+        &mut self,
+    ) -> <Stage as crate::tokio::connection::Connectable>::Output {
+        if !self.rtc.lock().unwrap().is_alive() {
+            tracing::debug!(
+                target: LOG_TARGET,
+                "`Rtc` is not alive, closing `WebRtcConnection`"
+            );
+
+            // WebRtcEvent::ConnectionClosed or __TBD
+            return self.stage.on_event_ice_disconnect();
+        }
+        self.rtc_poll_output()
     }
 
     /// Rtc Poll Output
@@ -366,10 +375,14 @@ pub struct OpenConfig {
 impl Connection<Opening> {
     /// Creates a new `Connection` in the Opening state.
     pub fn new(rtc: Arc<Mutex<Rtc>>, opening: Opening) -> Self {
+        // Create a channel for sending datagrams to the connection event handler.
+        let (relay_dgram, dgram_rx) = mpsc::channel(DATAGRAM_BUFFER_SIZE);
         Self {
             rtc,
             stage: opening,
             channels: HashMap::new(),
+            relay_dgram,
+            dgram_rx,
         }
     }
 
@@ -380,8 +393,9 @@ impl Connection<Opening> {
         Connection {
             rtc: self.rtc,
             channels: self.channels,
+            relay_dgram: self.relay_dgram,
+            dgram_rx: self.dgram_rx,
             stage: Open {
-                tx: self.stage.tx,
                 socket: config.socket,
                 dgram_rx: config.dgram_rx,
                 peer_address: config.peer_address,
@@ -410,27 +424,6 @@ impl Connection<Opening> {
         }
 
         Ok(())
-    }
-
-    /// Progress the [`Connection`] opening process.
-    pub(crate) fn poll_progress(&mut self) -> WebRtcEvent {
-        if !self.rtc.lock().unwrap().is_alive() {
-            tracing::debug!(
-                target: LOG_TARGET,
-                "`Rtc` is not alive, closing `WebRtcConnection`"
-            );
-
-            return WebRtcEvent::ConnectionClosed;
-        }
-
-        loop {
-            match self.rtc_poll_output() {
-                WebRtcEvent::None => {
-                    continue;
-                }
-                evt => return evt,
-            }
-        }
     }
 }
 
@@ -472,15 +465,6 @@ impl Connectable for Opening {
     fn on_event_ice_disconnect(&self) -> Self::Output {
         tracing::trace!(target: LOG_TARGET, "ice connection closed");
         WebRtcEvent::ConnectionClosed
-    }
-
-    /// Socket received some data, process it according to Opening State.
-    /// When the [State] is [Opening], we either are getting a [StunMessage] or
-    /// some other opening data. After we usher along the data we received, we
-    /// need to poll the opening Rtc connection to see what the next event is
-    /// and react accordingly.
-    fn recv_data(&mut self, message: &[u8]) -> std::result::Result<(), crate::tokio::error::Error> {
-        self.tx.try_send(message.to_vec()).map_err(|e| e.into())
     }
 
     /// Progress the opening of the channel, as applicable.
@@ -622,15 +606,6 @@ impl Connectable for Open {
         WebRtcEvent::ConnectionClosed
     }
 
-    /// Socket received some data, process it according to Opening State.
-    /// When the [State] is [Opening], we either are getting a [StunMessage] or
-    /// some other opening data. After we usher along the data we received, we
-    /// need to poll the opening Rtc connection to see what the next event is
-    /// and react accordingly.
-    fn recv_data(&mut self, message: &[u8]) -> std::result::Result<(), crate::tokio::error::Error> {
-        self.tx.try_send(message.to_vec()).map_err(|e| e.into())
-    }
-
     /// Progress the opening of the channel, as applicable.
     fn on_event_channel_open(&mut self, channel_id: ChannelId, name: String) -> Self::Output {
         tracing::trace!(
@@ -675,12 +650,12 @@ impl Connection<Open> {
     }
 
     /// Runs the connection loop to deal with Transmission and Events
-    pub async fn run(mut self) {
+    pub async fn run(&mut self) {
         loop {
             // Do something
             tokio::select! {
                             biased;
-                            datagram = self.stage.dgram_rx.recv() => match datagram {
+                            datagram = self.dgram_rx.recv() => match datagram {
                                 Some(datagram) => {
                                     let input = Input::Receive(
                                         Instant::now(),
@@ -693,9 +668,9 @@ impl Connection<Open> {
                                     );
 
                                     self.rtc
-                            .lock()
-                            .unwrap()
-                            .handle_input(input).unwrap();
+                                        .lock()
+                                        .unwrap()
+                                        .handle_input(input).unwrap();
                                 }
                                 None => {
                                     tracing::trace!(

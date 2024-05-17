@@ -11,10 +11,11 @@ use socket2::{Domain, Socket, Type};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use str0m::net::DatagramRecv;
 use tokio::net::UdpSocket;
+use tokio::sync::Mutex as AsyncMutex;
 
 use libp2p_core::transport::{ListenerId, TransportError, TransportEvent};
 use libp2p_core::Multiaddr;
@@ -60,7 +61,7 @@ impl<S: Unpin + Connectable + Send + Sync> Transport<S> {
 }
 
 impl<S: Unpin + Connectable + Send + Sync> libp2p_core::Transport for Transport<S> {
-    type Output = (PeerId, Connection<Open>);
+    type Output = (PeerId, Arc<AsyncMutex<Connection<Open>>>);
 
     type Error = Error;
 
@@ -76,8 +77,9 @@ impl<S: Unpin + Connectable + Send + Sync> libp2p_core::Transport for Transport<
         let addr =
             parse_webrtc_listen_addr(&addr).ok_or(TransportError::MultiaddrNotSupported(addr))?;
 
-        let udp_manager =
-            UDPManager::with_address(addr).map_err(|e| TransportError::Other(Error::Io(e)))?;
+        let udp_manager = Arc::new(Mutex::new(
+            UDPManager::with_address(addr).map_err(|e| TransportError::Other(Error::Io(e)))?,
+        ));
 
         self.listeners.push(
             ListenStream::new(id, self.config.clone(), udp_manager)
@@ -139,7 +141,7 @@ struct ListenStream<S: 'static + Unpin + Connectable + Send + Sync> {
     config: Config,
 
     /// The UDP Socket manager for this listener.
-    udp_manager: UDPManager<S>,
+    udp_manager: Arc<Mutex<UDPManager<S>>>,
 
     /// Set to `Some` if this listener should close.
     ///
@@ -167,9 +169,9 @@ impl<S: Unpin + Connectable + Send + Sync> ListenStream<S> {
     fn new(
         listener_id: ListenerId,
         config: Config,
-        udp_manager: UDPManager<S>,
+        udp_manager: Arc<Mutex<UDPManager<S>>>,
     ) -> io::Result<Self> {
-        let listen_addr = udp_manager.listen_addr();
+        let listen_addr = udp_manager.lock().unwrap().listen_addr();
         let if_watcher;
         let pending_event;
         if listen_addr.ip().is_unspecified() {
@@ -194,6 +196,26 @@ impl<S: Unpin + Connectable + Send + Sync> ListenStream<S> {
             pending_event,
             close_listener_waker: None,
         })
+    }
+
+    /// Report the listener as closed in a [`TransportEvent::ListenerClosed`] and
+    /// terminate the stream.
+    fn close(&mut self, reason: Result<(), Error>) {
+        match self.report_closed {
+            Some(_) => tracing::debug!("Listener was already closed"),
+            None => {
+                // Report the listener event as closed.
+                self.report_closed = Some(Some(TransportEvent::ListenerClosed {
+                    listener_id: self.listener_id,
+                    reason,
+                }));
+
+                // Wake the stream to deliver the last event.
+                if let Some(waker) = self.close_listener_waker.take() {
+                    waker.wake();
+                }
+            }
+        }
     }
 
     /// Polls the [ListenStream] for any [IfWatcher] events and relays any changes as
@@ -245,28 +267,6 @@ impl<S: Unpin + Connectable + Send + Sync> ListenStream<S> {
 
         socketaddr_to_multiaddr(&socket_addr, Some(self.config.fingerprint))
     }
-
-    /// Report the listener as closed in a [`TransportEvent::ListenerClosed`] and
-    /// terminate the stream.
-    fn close(&mut self, reason: Result<(), Error>) {
-        match self.report_closed {
-            Some(_) => tracing::debug!("Listener was already closed"),
-            None => {
-                // Report the listener event as closed.
-                let _ = self
-                    .report_closed
-                    .insert(Some(TransportEvent::ListenerClosed {
-                        listener_id: self.listener_id,
-                        reason,
-                    }));
-
-                // Wake the stream to deliver the last event.
-                if let Some(waker) = self.close_listener_waker.take() {
-                    waker.wake();
-                }
-            }
-        }
-    }
 }
 
 impl<S: 'static + Unpin + Connectable + Send + Sync> Stream for ListenStream<S> {
@@ -291,7 +291,9 @@ impl<S: 'static + Unpin + Connectable + Send + Sync> Stream for ListenStream<S> 
                 return Poll::Ready(Some(event));
             }
 
-            match self.udp_manager.poll(cx) {
+            let mut udp = self.udp_manager.lock().unwrap();
+
+            match udp.poll(cx) {
                 Poll::Ready(UDPManagerEvent::NewRemoteAddress(new_addr)) => {
                     let local_addr =
                         socketaddr_to_multiaddr(&self.listen_addr, Some(self.config.fingerprint));
@@ -300,7 +302,7 @@ impl<S: 'static + Unpin + Connectable + Send + Sync> Stream for ListenStream<S> 
                     let upgrade = upgrade::inbound(
                         new_addr.addr,
                         self.config.inner.clone(),
-                        self.udp_manager.socket(),
+                        self.udp_manager.clone(),
                         self.config.inner.dtls_cert().unwrap().clone(),
                         new_addr.ufrag,
                         self.config.id_keys.clone(),
@@ -317,6 +319,7 @@ impl<S: 'static + Unpin + Connectable + Send + Sync> Stream for ListenStream<S> 
                 }
                 Poll::Ready(UDPManagerEvent::Error(err)) => {
                     tracing::error!("Error in UDPManager: {:?}", err);
+                    drop(udp);
                     self.close(Err(err));
                     continue;
                 }

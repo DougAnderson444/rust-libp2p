@@ -24,22 +24,26 @@ use str0m::{
 };
 use str0m::{net::Protocol as Str0mProtocol, Candidate};
 use tokio::sync;
+use tokio::sync::Mutex as AsyncMutex;
 
 use super::{connection::Open, fingerprint, stream::Stream};
 
-const LOG_TARGET: &str = "libp2p_webrtc_str0m";
+/// The size of the buffer for incoming datagrams.
 const DATAGRAM_BUFFER_SIZE: usize = 1024;
 
+/// The log target for this module.
+const LOG_TARGET: &str = "libp2p_webrtc_str0m";
+
 /// Creates a new inbound WebRTC connection.
-pub(crate) async fn inbound(
+pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
     source: SocketAddr,
     config: RtcConfig,
-    socket: Arc<UdpSocket>,
+    udp_manager: Arc<Mutex<UDPManager<S>>>,
     dtls_cert: DtlsCert,
     remote_ufrag: String,
     id_keys: identity::Keypair,
     contents: Vec<u8>,
-) -> Result<(PeerId, Connection<Open>), Error> {
+) -> Result<(PeerId, Arc<AsyncMutex<Connection<Open>>>), Error> {
     tracing::debug!(address=%source, ufrag=%remote_ufrag, "new inbound connection from address");
 
     // using str0m:
@@ -50,7 +54,7 @@ pub(crate) async fn inbound(
     // 5) Poll connection for events
     // 6) Connection opened if successful
 
-    let destination = socket.local_addr().unwrap();
+    let destination = udp_manager.lock().unwrap().socket().local_addr().unwrap();
     let contents: DatagramRecv = contents.as_slice().try_into().unwrap();
 
     // create new `Rtc` object for the peer and give it the received STUN message
@@ -71,7 +75,7 @@ pub(crate) async fn inbound(
         .expect("client to handle input successfully");
 
     // A handle to send datagrams to the UDP socket
-    let (tx, dgram_rx) = sync::mpsc::channel(DATAGRAM_BUFFER_SIZE);
+    let (dgram_tx, dgram_rx) = sync::mpsc::channel(DATAGRAM_BUFFER_SIZE);
 
     // Open a new Connection and poll on the next event
     let mut connection: Arc<Mutex<Connection<Opening>>> = Arc::new(Mutex::new(Connection::new(
@@ -79,7 +83,10 @@ pub(crate) async fn inbound(
         Opening::new(noise_channel_id),
     )));
 
-    // loop until we get a Connection event
+    // This new Connection needs to be added to udp_manager.addr_conns
+
+    // loop until we get a Opening Connection event
+    // Because the Connection is Opening, our trait Output is implemented as WebRtcEvent.
     let event = loop {
         match connection
             .lock()
@@ -114,7 +121,12 @@ pub(crate) async fn inbound(
                 destination,
                 datagram,
             } => {
-                if let Err(error) = socket.try_send_to(&datagram, destination) {
+                if let Err(error) = udp_manager
+                    .lock()
+                    .unwrap()
+                    .socket()
+                    .try_send_to(&datagram, destination)
+                {
                     tracing::warn!(
                         target: LOG_TARGET,
                         ?source,
@@ -146,15 +158,16 @@ pub(crate) async fn inbound(
         return Err(Error::Disconnected);
     };
 
-    let stream =
-        create_substream_for_noise_handshake(&noise_channel_id, Arc::clone(&connection)).await?;
+    let (noise_stream, drop_listener) = Stream::new(noise_channel_id, Arc::clone(&connection))?;
+    // We don't care when the noise streamis closed
+    drop(drop_listener);
 
     let client_fingerprint: crate::tokio::Fingerprint =
         config.dtls_cert().unwrap().fingerprint().into();
 
     let peer_id = noise::inbound(
         id_keys,
-        stream,
+        noise_stream,
         client_fingerprint.into(),
         *remote_fingerprint,
     )
@@ -166,13 +179,25 @@ pub(crate) async fn inbound(
     let lock = Arc::try_unwrap(connection).expect("Connection Lock still has multiple owners");
     let connection_unlocked = lock.into_inner().expect("Mutex cannot be locked");
 
-    let connection = connection_unlocked.open(OpenConfig {
+    let socket = udp_manager.lock().unwrap().socket().clone();
+
+    let connection = Arc::new(AsyncMutex::new(connection_unlocked.open(OpenConfig {
         socket,
         peer_address,
         dgram_rx,
         peer,
         handshake_state,
+    })));
+
+    let connection_clone = Arc::clone(&connection);
+
+    // now that the connection is opened, we need to spawn an ongoing loop
+    // for the connection events to be handled in an ongoing manner
+    tokio::spawn(async move {
+        let mut connection = connection_clone.lock().await;
+        connection.run().await;
     });
+
     Ok((peer_id, connection))
 }
 
@@ -214,14 +239,4 @@ pub(crate) fn make_rtc_client(
     });
 
     (Arc::new(Mutex::new(rtc)), noise_channel_id)
-}
-
-async fn create_substream_for_noise_handshake(
-    id: &ChannelId,
-    connection: Arc<Mutex<Connection>>,
-) -> Result<Stream, Error> {
-    // use Rtc to create a channel for Noise, negotiated fag set to true
-    let (substream, drop_listener) = Stream::new(*id, connection)?;
-    drop(drop_listener);
-    Ok(substream)
 }

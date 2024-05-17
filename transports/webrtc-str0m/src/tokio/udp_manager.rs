@@ -93,7 +93,7 @@ enum NewSource {
 
 impl<S: Unpin + Connectable + Send + Sync> UDPManager<S> {
     /// Getter for socket
-    pub(crate) fn socket(&self) -> Arc<UdpSocket> {
+    pub fn socket(&self) -> Arc<UdpSocket> {
         self.socket.clone()
     }
 
@@ -193,6 +193,8 @@ impl<S: Unpin + Connectable + Send + Sync> UDPManager<S> {
         buffer: &[u8],
     ) -> Result<NewSource, error::Error> {
         // 1) If its Open or Opening, we have seen this addr before and we send data
+        // There should be a connection_event_handler running already to receive this data,
+        // which if there is a connection, will be true.
         if let Some(connection) = self.addr_conns.get_mut(&source) {
             connection.dgram_recv(&buffer)?;
             return Ok(NewSource::No);
