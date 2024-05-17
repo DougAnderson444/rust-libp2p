@@ -32,21 +32,13 @@ const LOG_TARGET: &str = "libp2p_webrtc_str0m";
 pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
     source: SocketAddr,
     config: RtcConfig,
-    udp_manager: Arc<Mutex<UDPManager<S>>>,
+    udp_manager: Arc<Mutex<UDPManager>>,
     dtls_cert: DtlsCert,
     remote_ufrag: String,
     id_keys: identity::Keypair,
     contents: Vec<u8>,
 ) -> Result<(PeerId, Arc<AsyncMutex<Connection<Open>>>), Error> {
     tracing::debug!(address=%source, ufrag=%remote_ufrag, "new inbound connection from address");
-
-    // using str0m:
-    // 1) Create a new inbound connection.
-    // 2) Set the remote description.
-    // 3) Get offer, create an answer.
-    // 4) Handle noise
-    // 5) Poll connection for events
-    // 6) Connection opened if successful
 
     let destination = udp_manager.lock().unwrap().socket().local_addr().unwrap();
     let contents: DatagramRecv = contents.as_slice().try_into().unwrap();
@@ -55,7 +47,6 @@ pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
     let (rtc, noise_channel_id) =
         make_rtc_client(&remote_ufrag, &remote_ufrag, source, destination, dtls_cert);
 
-    // Open a new Connection and poll on the next event
     let connection: Arc<Mutex<Connection<Opening>>> = Arc::new(Mutex::new(Connection::new(
         rtc.clone(),
         udp_manager.lock().unwrap().socket(),
@@ -63,7 +54,6 @@ pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
         Opening::new(noise_channel_id),
     )));
 
-    // This *should* be done through connection<opening>
     rtc.lock()
         .unwrap()
         .handle_input(Input::Receive(
@@ -78,6 +68,10 @@ pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
         .expect("client to handle input successfully");
 
     // This new Connection needs to be added to udp_manager.addr_conns
+    udp_manager
+        .lock()
+        .unwrap()
+        .add_connection(source, connection.clone());
 
     // loop until we get a Opening Connection event
     // Because the Connection is Opening, our trait Output is implemented as WebRtcEvent.

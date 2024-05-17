@@ -43,7 +43,11 @@ pub trait Connectable {
 
     /// On transmit data, with associate type for the return output
     /// Handle [`str0m::Output::Transmit`] events.
-    fn on_output_transmit(&mut self, transmit: str0m::net::Transmit) -> Self::Output;
+    fn on_output_transmit(
+        &mut self,
+        socket: Arc<UdpSocket>,
+        transmit: str0m::net::Transmit,
+    ) -> Self::Output;
 
     /// Handle Rtc Errors
     fn on_rtc_error(&mut self, error: str0m::RtcError) -> Self::Output;
@@ -261,7 +265,7 @@ impl<Stage: Connectable> Connection<Stage> {
         Ok(self.relay_dgram.try_send(buf.to_vec())?)
     }
 
-    /// Progress the [`Connection`] opening process.
+    /// Progress the [`Connection`] process.
     /// <Stage as ::tokio::connection::Connectable>::Output
     pub(crate) fn poll_progress(
         &mut self,
@@ -301,7 +305,9 @@ impl<Stage: Connectable> Connection<Stage> {
             }
         };
         match out {
-            Output::Transmit(transmit) => self.stage.on_output_transmit(transmit),
+            Output::Transmit(transmit) => {
+                self.stage.on_output_transmit(self.socket.clone(), transmit)
+            }
             Output::Timeout(timeout) => self.stage.on_output_timeout(timeout),
             Output::Event(e) => match e {
                 Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
@@ -336,6 +342,9 @@ impl<Stage: Connectable> Connection<Stage> {
 
                     // 2) Wake the PollDataChannel to actually close the channel
                     self.channel(&channel_id).wake(WakerType::Close);
+
+                    // remove the channel from the channels HashMap
+                    self.channels.remove(&channel_id);
 
                     // 3) Deal with the Stage specific handler for Channel Closed event
                     self.stage.on_event_channel_close(channel_id)
@@ -434,7 +443,11 @@ impl Connectable for Opening {
         self.handshake_state.clone()
     }
 
-    fn on_output_transmit(&mut self, transmit: str0m::net::Transmit) -> Self::Output {
+    fn on_output_transmit(
+        &mut self,
+        socket: Arc<UdpSocket>,
+        transmit: str0m::net::Transmit,
+    ) -> Self::Output {
         tracing::trace!(
             target: LOG_TARGET,
             "transmit data",
@@ -566,22 +579,29 @@ impl Connectable for Opening {
 
 /// Impl Connectable for Open
 impl Connectable for Open {
-    type Output = WebRtcEvent;
+    /// When Connection is Open, the only output is [str0m::Output::Timeout] ( [Instant] ).
+    type Output = Option<std::time::Instant>;
 
     /// Returns the [`HandshakeState`] of the connection.
     fn handshake_state(&self) -> HandshakeState {
         self.handshake_state.clone()
     }
 
-    fn on_output_transmit(&mut self, transmit: str0m::net::Transmit) -> Self::Output {
+    fn on_output_transmit(
+        &mut self,
+        socket: Arc<UdpSocket>,
+        transmit: str0m::net::Transmit,
+    ) -> Self::Output {
         tracing::trace!(
             target: LOG_TARGET,
             "transmit data",
         );
-        WebRtcEvent::Transmit {
-            destination: transmit.destination,
-            datagram: transmit.contents,
-        }
+
+        socket
+            .try_send_to(&transmit.contents, transmit.destination)
+            .expect("send data");
+
+        None
     }
 
     /// Return [WebRtcEvent::ConnectionClosed] when an error occurs.
@@ -591,18 +611,18 @@ impl Connectable for Open {
             ?error,
             "WebRTC connection error",
         );
-        WebRtcEvent::ConnectionClosed
+        None
     }
 
-    /// Return [WebRtcEvent::Timeout] when an error occurs while [`Opening`].
+    /// Return [`Instant`] when a timeout occurs while [`Open`].
     fn on_output_timeout(&mut self, timeout: Instant) -> Self::Output {
-        WebRtcEvent::Timeout { timeout }
+        Some(timeout)
     }
 
     /// If ICE Connection State is Disconnected, return [WebRtcEvent::ConnectionClosed].
     fn on_event_ice_disconnect(&self) -> Self::Output {
         tracing::trace!(target: LOG_TARGET, "ice connection closed");
-        WebRtcEvent::ConnectionClosed
+        None
     }
 
     /// Progress the opening of the channel, as applicable.
@@ -615,7 +635,7 @@ impl Connectable for Open {
             "channel opened",
         );
 
-        WebRtcEvent::None
+        None
     }
 
     fn on_event_channel_data(&mut self, data: ChannelData) -> Self::Output {

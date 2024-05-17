@@ -142,7 +142,7 @@ struct ListenStream<S: 'static + Unpin + Connectable + Send + Sync> {
     config: Config,
 
     /// The UDP Socket manager for this listener.
-    udp_manager: Arc<Mutex<UDPManager<S>>>,
+    udp_manager: Arc<Mutex<UDPManager>>,
 
     /// Set to `Some` if this listener should close.
     ///
@@ -170,7 +170,7 @@ impl<S: Unpin + Connectable + Send + Sync> ListenStream<S> {
     fn new(
         listener_id: ListenerId,
         config: Config,
-        udp_manager: Arc<Mutex<UDPManager<S>>>,
+        udp_manager: Arc<Mutex<UDPManager>>,
     ) -> io::Result<Self> {
         let listen_addr = udp_manager.lock().unwrap().listen_addr();
         let if_watcher;
@@ -295,18 +295,18 @@ impl<S: 'static + Unpin + Connectable + Send + Sync> Stream for ListenStream<S> 
                 return Poll::Ready(Some(event));
             }
 
-            let mut manager = self.udp_manager.lock().unwrap();
+            let mut udp = self.udp_manager.lock().unwrap();
 
             // UDP Manager will only bubble up new addresses for tracking, and
             // errors for closing. All other UDP Events are handled internally
             // within the upgraded connection.
-            match manager.poll(cx) {
+            match udp.poll(cx) {
                 Poll::Ready(UDPManagerEvent::NewRemoteAddress(remote)) => {
                     let local_addr =
                         socketaddr_to_multiaddr(&self.listen_addr, Some(self.config.fingerprint));
                     let send_back_addr = socketaddr_to_multiaddr(&remote.addr, None);
 
-                    let upgrade = upgrade::inbound(
+                    let upgrade = upgrade::inbound::<S>(
                         remote.addr,
                         self.config.inner.clone(),
                         self.udp_manager.clone(),
@@ -326,7 +326,7 @@ impl<S: 'static + Unpin + Connectable + Send + Sync> Stream for ListenStream<S> 
                 }
                 Poll::Ready(UDPManagerEvent::Error(err)) => {
                     tracing::error!("Error in UDPManager: {:?}", err);
-                    drop(manager);
+                    drop(udp);
                     self.close(Err(err));
                     continue;
                 }

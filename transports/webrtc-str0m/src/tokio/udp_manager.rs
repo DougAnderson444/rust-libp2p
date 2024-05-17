@@ -9,7 +9,7 @@ use crate::tokio::{
 use libp2p_core::transport::ListenerId;
 use libp2p_identity::PeerId;
 use socket2::{Domain, Socket, Type};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -65,7 +65,7 @@ enum ConnectionState {
 }
 
 /// The `UDPManager` struct is responsible for managing the UDP connections used by the WebRTC transport.
-pub(crate) struct UDPManager<S: Unpin + Connectable> {
+pub(crate) struct UDPManager {
     /// The UDP socket used for sending and receiving data.
     socket: Arc<UdpSocket>,
 
@@ -73,7 +73,7 @@ pub(crate) struct UDPManager<S: Unpin + Connectable> {
     listen_addr: SocketAddr,
 
     /// All the address connections we are tracking.
-    addr_conns: HashMap<SocketAddr, Connection<S>>,
+    addr_conns: HashMap<SocketAddr, Arc<Mutex<Connection>>>,
 }
 
 /// Whether this is a new connection that should be Polled or not.
@@ -82,10 +82,15 @@ enum NewSource {
     No,
 }
 
-impl<S: Unpin + Connectable + Send + Sync> UDPManager<S> {
+impl UDPManager {
     /// Getter for socket
     pub fn socket(&self) -> Arc<UdpSocket> {
         self.socket.clone()
+    }
+
+    /// Adds an address to addr_conns.
+    pub fn add_connection(&mut self, addr: SocketAddr, connection: Arc<Mutex<Connection>>) {
+        self.addr_conns.insert(addr, connection);
     }
 
     /// Creates a new `UDPManager` with the given address.
@@ -187,7 +192,10 @@ impl<S: Unpin + Connectable + Send + Sync> UDPManager<S> {
         // There should be a connection_event_handler running already to receive this data,
         // which if there is a connection, will be true.
         if let Some(connection) = self.addr_conns.get_mut(&source) {
-            connection.dgram_recv(&buffer)?;
+            connection
+                .lock()
+                .map_err(|_| Error::LockPoisoned)?
+                .dgram_recv(buffer)?;
             return Ok(NewSource::No);
         }
 

@@ -21,7 +21,7 @@ use crate::tokio::Error;
 // let channel = Arc::new(rtc.channel(*id).unwrap()).unwrap().write(data)
 #[derive(Debug, Clone)]
 pub(crate) struct PollDataChannel {
-    /// Connection.rtc_poll_output gives us incoming data
+    /// Connection rtc.poll_output gives us incoming data
     connection: Arc<Mutex<Connection>>,
     /// Rtc + ChannelId = Channel.write() for outgoing data
     channel_id: ChannelId,
