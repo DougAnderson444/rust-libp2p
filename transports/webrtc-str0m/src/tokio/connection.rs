@@ -195,8 +195,6 @@ pub struct Open {
     peer_address: PeerAddress,
     /// Transport socket.
     socket: Arc<UdpSocket>,
-    /// RX channel for receiving datagrams from the transport.
-    dgram_rx: Receiver<Vec<u8>>,
     /// Remote peer ID.
     peer: PeerId,
     /// The state of the opening connection handshake
@@ -208,13 +206,11 @@ impl Open {
     pub fn new(
         socket: Arc<UdpSocket>,
         peer_address: PeerAddress,
-        dgram_rx: Receiver<Vec<u8>>,
         peer: PeerId,
         handshake_state: HandshakeState,
     ) -> Self {
         Self {
             socket,
-            dgram_rx,
             peer_address,
             peer,
             handshake_state,
@@ -361,8 +357,6 @@ impl<Stage: Connectable> Connection<Stage> {
 pub struct OpenConfig {
     /// Transport socket.
     pub socket: Arc<UdpSocket>,
-    /// RX channel for receiving datagrams from the transport.
-    pub dgram_rx: Receiver<Vec<u8>>,
     /// Remote peer ID.
     pub peer: PeerId,
     /// The state of the opening connection handshake
@@ -397,7 +391,6 @@ impl Connection<Opening> {
             dgram_rx: self.dgram_rx,
             stage: Open {
                 socket: config.socket,
-                dgram_rx: config.dgram_rx,
                 peer_address: config.peer_address,
                 peer: config.peer,
                 handshake_state: config.handshake_state,

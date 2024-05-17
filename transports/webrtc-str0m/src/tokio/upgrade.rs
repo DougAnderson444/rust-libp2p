@@ -74,9 +74,6 @@ pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
         ))
         .expect("client to handle input successfully");
 
-    // A handle to send datagrams to the UDP socket
-    let (dgram_tx, dgram_rx) = sync::mpsc::channel(DATAGRAM_BUFFER_SIZE);
-
     // Open a new Connection and poll on the next event
     let mut connection: Arc<Mutex<Connection<Opening>>> = Arc::new(Mutex::new(Connection::new(
         rtc,
@@ -184,7 +181,6 @@ pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
     let connection = Arc::new(AsyncMutex::new(connection_unlocked.open(OpenConfig {
         socket,
         peer_address,
-        dgram_rx,
         peer,
         handshake_state,
     })));
