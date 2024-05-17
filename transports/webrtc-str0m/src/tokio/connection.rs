@@ -255,6 +255,11 @@ impl<Stage> Unpin for Connection<Stage> {}
 
 /// Implementations that apply to both [Stages].
 impl<Stage: Connectable> Connection<Stage> {
+    /// Getter for Rtc
+    pub fn rtc(&self) -> Arc<Mutex<Rtc>> {
+        Arc::clone(&self.rtc)
+    }
+
     /// Getter for all channels
     pub fn channels(&mut self) -> &mut HashMap<ChannelId, DataChannel> {
         &mut self.channels

@@ -10,7 +10,7 @@ use futures::task::AtomicWaker;
 use futures::{AsyncRead, AsyncWrite};
 use libp2p_webrtc_utils::MAX_MSG_LEN;
 use str0m::channel::ChannelId;
-use str0m::Rtc;
+use str0m::{Rtc, RtcError};
 use tokio_util::bytes::BytesMut;
 
 use super::super::connection::Connection;
@@ -141,7 +141,17 @@ impl AsyncWrite for PollDataChannel {
         futures::ready!(this.poll_ready(cx))?;
 
         // write data to the channel
-        todo!()
+        let rtc = this.connection().rtc();
+        let mut rtc = rtc.lock().unwrap();
+        let mut channel = rtc.channel(this.channel_id).unwrap();
+        let binary = true;
+        match channel.write(binary, buf) {
+            Ok(len) => {
+                let len: usize = len;
+                Poll::Ready(Ok::<usize, io::Error>(len))
+            }
+            Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
