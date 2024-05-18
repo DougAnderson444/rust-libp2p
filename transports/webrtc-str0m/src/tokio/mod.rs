@@ -5,7 +5,6 @@ mod channel;
 mod connection;
 mod error;
 mod fingerprint;
-mod opening;
 mod stream;
 mod transport;
 mod udp_manager;
