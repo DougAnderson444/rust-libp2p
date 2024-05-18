@@ -1,4 +1,4 @@
-//! Transport module
+//! WebRTC Transport for libp2p, base on [str0m] WebRTC library.
 
 use futures::future::BoxFuture;
 use futures::prelude::*;
@@ -25,8 +25,7 @@ use crate::tokio::error::Error;
 use crate::tokio::fingerprint::Fingerprint;
 use crate::tokio::udp_manager::{UDPManager, UDPManagerEvent};
 
-use super::connection::{Connectable, Open};
-use super::udp_manager::NewRemoteAddress;
+use super::connection::Open;
 use super::upgrade;
 
 /// A WebRTC transport with direct p2p communication (without a STUN server).
@@ -266,16 +265,15 @@ impl ListenStream {
         socketaddr_to_multiaddr(&socket_addr, Some(self.config.fingerprint))
     }
 
-    /// Upgrades this incound remote source
-    fn upgrade_inbound(&self, remote: NewRemoteAddress) {}
+    // TODO: Move upgrade::inbound here
+    // /// Upgrades this incound remote source
+    // fn upgrade_inbound(&self, remote: NewRemoteAddress) {}
 }
 
 impl Stream for ListenStream {
     type Item = TransportEvent<<Transport as libp2p_core::Transport>::ListenerUpgrade, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // let this = Pin::into_inner(self);
-
         loop {
             // If a [TransportEvent::NewAddress] event is pending, return it.
             if let Some(event) = self.pending_event.take() {

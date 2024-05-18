@@ -64,7 +64,7 @@ impl Connection<Opening> {
             local_address: self.local_address,
             socket: self.socket,
             stage: Open::new(OpenConfig {
-                peer: config.peer,
+                peer_id: config.peer_id,
                 handshake_state: config.handshake_state,
             }),
         }
@@ -107,7 +107,7 @@ impl Connectable for Opening {
     ) -> Self::Output {
         tracing::trace!(
             target: LOG_TARGET,
-            "transmit data",
+            "transmit opening data",
         );
 
         // socket().try_send_to
@@ -119,13 +119,9 @@ impl Connectable for Opening {
             );
 
             // return WebRtcEvent::ConnectionClosed; // Should we assume this?
-            return OpeningEvent::None;
         }
 
-        OpeningEvent::Transmit {
-            destination: transmit.destination,
-            datagram: transmit.contents,
-        }
+        OpeningEvent::None
     }
 
     /// Handle error for Opening connection.
@@ -243,7 +239,6 @@ impl Connectable for Opening {
                 };
 
                 OpeningEvent::ConnectionOpened {
-                    peer: todo!(),
                     remote_fingerprint: remote_fp,
                 }
             }
@@ -255,7 +250,7 @@ impl Connectable for Opening {
                     "unexpected handshake state, invalid state for connection, should be closed",
                 );
 
-                return OpeningEvent::ConnectionClosed;
+                OpeningEvent::ConnectionClosed
             }
         }
     }

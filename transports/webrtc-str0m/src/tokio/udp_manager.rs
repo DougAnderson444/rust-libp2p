@@ -1,7 +1,5 @@
 //! This module contains the `UDPManager` struct which is responsible for managing the UDP connections used by the WebRTC transport.
-// mod req_res_chan;
 
-use crate::tokio::connection::Connectable;
 use crate::tokio::{
     connection::{Open, Opening},
     error, Connection, Error,

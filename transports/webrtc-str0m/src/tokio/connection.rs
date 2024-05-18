@@ -89,25 +89,12 @@ pub enum OpeningEvent {
         timeout: Instant,
     },
 
-    /// Transmit data to remote peer.
-    Transmit {
-        /// Destination.
-        destination: SocketAddr,
-
-        /// Datagram to transmit.
-        datagram: DatagramSend,
-    },
-
     /// Connection closed.
     ConnectionClosed,
 
     /// Connection established.
     ConnectionOpened {
-        /// Remote peer ID.
-        peer: PeerId,
         remote_fingerprint: Fingerprint,
-        // /// Endpoint.
-        // endpoint: Endpoint,
     },
     None,
 }
@@ -230,8 +217,8 @@ impl<Stage: Connectable> Connection<Stage> {
     fn rtc_poll_output(&mut self) -> <Stage as crate::tokio::connection::Connectable>::Output {
         let out = {
             let mut rtc = self.rtc.lock().unwrap();
-            let output = rtc.poll_output();
-            match output {
+            let polled_output = rtc.poll_output();
+            match polled_output {
                 Ok(output) => output,
                 Err(error) => {
                     tracing::debug!(
@@ -242,9 +229,7 @@ impl<Stage: Connectable> Connection<Stage> {
                     );
 
                     drop(rtc);
-                    let ret = self.stage.on_rtc_error(error);
-
-                    return ret;
+                    return self.stage.on_rtc_error(error);
                 }
             }
         };

@@ -26,7 +26,7 @@ use super::{connection::Open, fingerprint, stream::Stream};
 /// The log target for this module.
 const LOG_TARGET: &str = "libp2p_webrtc_str0m";
 
-/// Creates a new inbound WebRTC connection.
+/// Upgrades a new inbound WebRTC connection ith Noise Protocol.
 pub(crate) async fn inbound(
     source: SocketAddr,
     config: RtcConfig,
@@ -38,10 +38,10 @@ pub(crate) async fn inbound(
 ) -> Result<(PeerId, Arc<AsyncMutex<Connection<Open>>>), Error> {
     tracing::debug!(address=%source, ufrag=%remote_ufrag, "new inbound connection from address");
 
-    let destination = udp_manager.lock().unwrap().socket().local_addr().unwrap();
-    let contents: DatagramRecv = contents.as_slice().try_into().unwrap();
+    let destination = udp_manager.lock().unwrap().socket().local_addr()?;
+    let contents: DatagramRecv = contents.as_slice().try_into()?;
 
-    // create new `Rtc` object for the peer and give it the received STUN message
+    // Create new `Rtc` object for this source
     let (rtc, noise_channel_id) =
         make_rtc_client(&remote_ufrag, &remote_ufrag, source, destination, dtls_cert);
 
@@ -52,8 +52,15 @@ pub(crate) async fn inbound(
         Opening::new(noise_channel_id),
     )));
 
-    rtc.lock()
+    // This new Connection needs to be added to udp_manager.addr_conns
+    udp_manager
+        .lock()
         .unwrap()
+        .add_connection(source, connection.clone());
+
+    // Cast the datagram into a str0m::Receive and pass it to the str0m client
+    rtc.lock()
+        .map_err(|_| Error::LockPoisoned)?
         .handle_input(Input::Receive(
             Instant::now(),
             Receive {
@@ -62,36 +69,32 @@ pub(crate) async fn inbound(
                 destination,
                 contents,
             },
-        ))
-        .expect("client to handle input successfully");
-
-    // This new Connection needs to be added to udp_manager.addr_conns
-    udp_manager
-        .lock()
-        .unwrap()
-        .add_connection(source, connection.clone());
+        ))?;
 
     // Poll the connection to make progress towards an OpeningEvent.
+    // For Opening, we only care about
+    // 1) Timeout,
+    // 2) ConnectionClosed,
+    // 3) ConnectionOpened
+    // 4) None
     let event = loop {
         match connection
             .lock()
             .map_err(|_| Error::LockPoisoned)?
             .poll_progress()
         {
+            // Keep looping
             OpeningEvent::None => {
                 continue;
             }
+            // Timeout, Closed, or Established
             val => {
                 break val;
             }
         }
     };
 
-    let OpeningEvent::ConnectionOpened {
-        peer,
-        remote_fingerprint,
-    } = event
-    else {
+    let OpeningEvent::ConnectionOpened { remote_fingerprint } = event else {
         return Err(Error::Disconnected);
     };
 
@@ -115,10 +118,8 @@ pub(crate) async fn inbound(
     let conn_lock = Arc::try_unwrap(connection).map_err(|_| Error::LockPoisoned)?;
     let connection = conn_lock.into_inner().expect("Mutex cannot be locked");
 
-    let socket = udp_manager.lock().unwrap().socket().clone();
-
     let connection = Arc::new(AsyncMutex::new(connection.open(OpenConfig {
-        peer,
+        peer_id,
         handshake_state,
     })));
 

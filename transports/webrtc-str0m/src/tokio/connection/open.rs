@@ -15,7 +15,7 @@ impl Open {
     /// Creates a new `Open` state.
     pub fn new(config: OpenConfig) -> Self {
         Self {
-            peer: config.peer,
+            peer: config.peer_id,
             handshake_state: config.handshake_state,
         }
     }
@@ -25,7 +25,7 @@ impl Open {
 #[derive(Debug)]
 pub struct OpenConfig {
     /// Remote peer ID.
-    pub peer: PeerId,
+    pub peer_id: PeerId,
     /// The state of the opening connection handshake
     pub handshake_state: HandshakeState,
 }
