@@ -78,7 +78,6 @@ impl Connectable for Open {
         None
     }
 
-    /// Progress the opening of the channel, as applicable.
     fn on_event_channel_open(&mut self, channel_id: ChannelId, name: String) -> Self::Output {
         tracing::trace!(
             target: LOG_TARGET,
@@ -91,7 +90,10 @@ impl Connectable for Open {
         None
     }
 
-    fn on_event_channel_data(&mut self, _data: ChannelData) -> Self::Output {
+    /// [Connection] is [Open] and got a [`str0m::Event::ChannelData`] ([`str0m::channel::ChannelData`]),
+    /// this function passes that to [Connection] [StreamMuxer] Substream for streaming data.
+    fn on_event_channel_data(&mut self, channel: ChannelData) -> Self::Output {
+        // get the channel.id from self.channels
         todo!()
     }
 

@@ -23,6 +23,7 @@ use std::{
     time::Instant,
 };
 
+use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
 use libp2p_identity::PeerId;
 use str0m::{
     channel::{ChannelData, ChannelId},
@@ -35,6 +36,7 @@ use tokio::sync::mpsc::{self, Receiver};
 use crate::tokio::Error;
 
 use super::channel::{DataChannel, RtcDataChannelState, WakerType};
+use super::stream::Stream;
 
 /// The size of the buffer for incoming datagrams.
 const DATAGRAM_BUFFER_SIZE: usize = 1024;
@@ -62,9 +64,10 @@ pub trait Connectable {
     /// Handle Rtc Timeout
     fn on_output_timeout(&mut self, rtc: Arc<Mutex<Rtc>>, timeout: Instant) -> Self::Output;
 
+    /// Handles [`str0m::Event::IceConnectionStateChange`] `IceConnectionStateChange::disonnected` event.
     fn on_event_ice_disconnect(&self) -> Self::Output;
 
-    /// Store the Channel Id
+    /// Handles [`str0m::Event::ChannelOpen`] events
     fn on_event_channel_open(&mut self, channel_id: ChannelId, name: String) -> Self::Output;
 
     /// Handles [`str0m::Event::ChannelData`] events
@@ -197,6 +200,11 @@ impl<Stage: Connectable> Connection<Stage> {
         Ok(self.relay_dgram.try_send(buf.to_vec())?)
     }
 
+    /// Report the connection as closed.
+    pub fn report_connection_closed(&self) {
+        todo!()
+    }
+
     /// Progress the [`Connection`] process.
     /// <Stage as ::tokio::connection::Connectable>::Output
     pub(crate) fn poll_progress(
@@ -208,6 +216,9 @@ impl<Stage: Connectable> Connection<Stage> {
                 "`Rtc` is not alive, closing `WebRtcConnection`"
             );
 
+            // First handle connection level close
+            self.report_connection_closed();
+            // Next handle the Stage specific close
             return self.stage.on_event_ice_disconnect();
         }
         self.rtc_poll_output()
@@ -240,6 +251,9 @@ impl<Stage: Connectable> Connection<Stage> {
             Output::Timeout(timeout) => self.stage.on_output_timeout(self.rtc(), timeout),
             Output::Event(e) => match e {
                 Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
+                    // First handle connection level close
+                    self.report_connection_closed();
+                    // Next handle the Stage specific close
                     self.stage.on_event_ice_disconnect()
                 }
                 Event::ChannelOpen(channel_id, name) => {
@@ -285,5 +299,41 @@ impl<Stage: Connectable> Connection<Stage> {
                 event => self.stage.on_event(event),
             },
         }
+    }
+}
+
+/// WebRTC native multiplexing
+/// Allow users to open their substreams
+impl StreamMuxer for Connection<Opening> {
+    type Substream = Stream;
+    type Error = Error;
+
+    fn poll_inbound(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Self::Substream, Self::Error>> {
+        // wait for inbound data channels to be ready
+        todo!()
+    }
+
+    fn poll_outbound(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Self::Substream, Self::Error>> {
+        todo!()
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        todo!()
+    }
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<StreamMuxerEvent, Self::Error>> {
+        todo!()
     }
 }

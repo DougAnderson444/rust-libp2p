@@ -22,7 +22,7 @@ use super::{Connection, Error};
 ///
 /// To be a proper libp2p substream, we need to implement [`AsyncRead`] and [`AsyncWrite`] as well
 /// as support a half-closed state which we do by framing messages in a protobuf envelope.
-pub(crate) struct Stream {
+pub struct Stream {
     inner: libp2p_webrtc_utils::Stream<PollDataChannel>,
 }
 
