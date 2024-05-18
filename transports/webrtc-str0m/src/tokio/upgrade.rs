@@ -27,7 +27,7 @@ use super::{connection::Open, fingerprint, stream::Stream};
 const LOG_TARGET: &str = "libp2p_webrtc_str0m";
 
 /// Creates a new inbound WebRTC connection.
-pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
+pub(crate) async fn inbound(
     source: SocketAddr,
     config: RtcConfig,
     udp_manager: Arc<Mutex<UDPManager>>,
@@ -118,7 +118,6 @@ pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
     let socket = udp_manager.lock().unwrap().socket().clone();
 
     let connection = Arc::new(AsyncMutex::new(connection.open(OpenConfig {
-        socket,
         peer,
         handshake_state,
     })));

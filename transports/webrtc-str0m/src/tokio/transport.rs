@@ -7,14 +7,11 @@ use futures::Stream;
 use if_watch::tokio::IfWatcher;
 use if_watch::IfEvent;
 use libp2p_core::multiaddr::Protocol;
-use socket2::{Domain, Socket, Type};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use str0m::net::DatagramRecv;
-use tokio::net::UdpSocket;
 use tokio::sync::Mutex as AsyncMutex;
 
 use libp2p_core::transport::{ListenerId, TransportError, TransportEvent};
@@ -33,14 +30,14 @@ use super::udp_manager::NewRemoteAddress;
 use super::upgrade;
 
 /// A WebRTC transport with direct p2p communication (without a STUN server).
-pub struct Transport<S: 'static + Unpin + Connectable + Send + Sync> {
+pub struct Transport {
     /// The config which holds this peer's keys and certificate.
     config: Config,
     /// All the active listeners.
-    listeners: SelectAll<ListenStream<S>>,
+    listeners: SelectAll<ListenStream>,
 }
 
-impl<S: Unpin + Connectable + Send + Sync> Transport<S> {
+impl Transport {
     /// Creates a new WebRTC transport.
     ///
     /// # Example
@@ -61,7 +58,7 @@ impl<S: Unpin + Connectable + Send + Sync> Transport<S> {
     }
 }
 
-impl<S: Unpin + Connectable + Send + Sync> libp2p_core::Transport for Transport<S> {
+impl libp2p_core::Transport for Transport {
     type Output = (PeerId, Arc<AsyncMutex<Connection<Open>>>);
 
     type Error = Error;
@@ -129,7 +126,7 @@ impl<S: Unpin + Connectable + Send + Sync> libp2p_core::Transport for Transport<
 }
 
 /// A stream of incoming connections on one or more interfaces.
-struct ListenStream<S: 'static + Unpin + Connectable + Send + Sync> {
+struct ListenStream {
     /// The ID of this listener.
     listener_id: ListenerId,
 
@@ -165,7 +162,7 @@ struct ListenStream<S: 'static + Unpin + Connectable + Send + Sync> {
     close_listener_waker: Option<Waker>,
 }
 
-impl<S: Unpin + Connectable + Send + Sync> ListenStream<S> {
+impl ListenStream {
     /// Creates a new [`ListenStream`] with the given listener id, config, and socket.
     fn new(
         listener_id: ListenerId,
@@ -273,8 +270,8 @@ impl<S: Unpin + Connectable + Send + Sync> ListenStream<S> {
     fn upgrade_inbound(&self, remote: NewRemoteAddress) {}
 }
 
-impl<S: 'static + Unpin + Connectable + Send + Sync> Stream for ListenStream<S> {
-    type Item = TransportEvent<<Transport<S> as libp2p_core::Transport>::ListenerUpgrade, Error>;
+impl Stream for ListenStream {
+    type Item = TransportEvent<<Transport as libp2p_core::Transport>::ListenerUpgrade, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // let this = Pin::into_inner(self);
@@ -306,7 +303,7 @@ impl<S: 'static + Unpin + Connectable + Send + Sync> Stream for ListenStream<S> 
                         socketaddr_to_multiaddr(&self.listen_addr, Some(self.config.fingerprint));
                     let send_back_addr = socketaddr_to_multiaddr(&remote.addr, None);
 
-                    let upgrade = upgrade::inbound::<S>(
+                    let upgrade = upgrade::inbound(
                         remote.addr,
                         self.config.inner.clone(),
                         self.udp_manager.clone(),
