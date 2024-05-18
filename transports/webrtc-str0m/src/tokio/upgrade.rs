@@ -71,9 +71,7 @@ pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
         .unwrap()
         .add_connection(source, connection.clone());
 
-    // loop ove rpoll_progress(), if returns OpeningEvent::None, continue loop
-    // If retruns OpeningEvent::ConnectionOpened, break loop as assign this reslt to destrucutred {peer, remote_fingerprint}
-    // If anything other than None or ConnectionOpened, reutn Err(Error::Disconnected)
+    // Poll the connection to make progress towards an OpeningEvent.
     let event = loop {
         match connection
             .lock()
@@ -114,8 +112,8 @@ pub(crate) async fn inbound<S: Unpin + Connectable + Send + Sync>(
 
     let handshake_state = HandshakeState::Opened { remote_fingerprint };
 
-    let lock = Arc::try_unwrap(connection).expect("Connection Lock still has multiple owners");
-    let connection = lock.into_inner().expect("Mutex cannot be locked");
+    let conn_lock = Arc::try_unwrap(connection).map_err(|_| Error::LockPoisoned)?;
+    let connection = conn_lock.into_inner().expect("Mutex cannot be locked");
 
     let socket = udp_manager.lock().unwrap().socket().clone();
 

@@ -13,7 +13,7 @@ use std::{
     net::SocketAddr,
     ops::Deref,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use libp2p_identity::PeerId;
@@ -159,7 +159,7 @@ impl Opening {
 
 /// Peer Address
 #[derive(Debug)]
-pub struct PeerAddress(pub SocketAddr);
+pub(crate) struct PeerAddress(pub(crate) SocketAddr);
 
 /// PeerAddress is a smart pointer, this gets the inner value easily:
 impl Deref for PeerAddress {
@@ -524,8 +524,15 @@ impl Connectable for Opening {
         OpeningEvent::None
     }
 
-    fn on_event_channel_data(&mut self, data: ChannelData) -> Self::Output {
-        todo!()
+    /// When Opening, ChannelData should be the Noise Handshake,
+    /// which is handled by the Noise Protocol during `upgrade::inbound` or `upgrade::outbound`?
+    fn on_event_channel_data(&mut self, _data: ChannelData) -> Self::Output {
+        tracing::trace!(
+            target: LOG_TARGET,
+            "(noise protocol?) data received over channel",
+        );
+
+        OpeningEvent::None
     }
 
     fn on_event_channel_close(&mut self, channel_id: ChannelId) -> Self::Output {
