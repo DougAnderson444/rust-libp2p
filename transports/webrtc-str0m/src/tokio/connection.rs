@@ -38,7 +38,7 @@ use tokio::sync::mpsc::{self, Receiver};
 
 use crate::tokio::Error;
 
-use super::channel::{ChannelWakers, RtcDataChannelState, WakerType};
+use super::channel::{ChannelWakers, RtcDataChannelState};
 use super::stream::{DropListener, Stream};
 
 /// The size of the buffer for incoming datagrams.
@@ -163,7 +163,7 @@ pub struct Connection<Stage = Opening> {
     channel_wakers: HashMap<ChannelId, ChannelWakers>,
 
     /// [ReadReady] channel data receivers for each channel
-    channel_data_rx: HashMap<ChannelId, futures::channel::mpsc::Receiver<ReadReady>>,
+    channel_data_rx: HashMap<ChannelId, Mutex<futures::channel::mpsc::Receiver<ReadReady>>>,
 
     /// Rtc object associated with the connection.
     rtc: Arc<Mutex<Rtc>>,
@@ -255,56 +255,94 @@ impl<Stage: Connectable> Connection<Stage> {
                 self.stage.on_output_transmit(self.socket.clone(), transmit)
             }
             Output::Timeout(timeout) => self.stage.on_output_timeout(self.rtc(), timeout),
-            Output::Event(e) => match e {
-                Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
-                    // First handle connection level close
-                    self.report_connection_closed();
-                    // Next handle the Stage specific close
-                    self.stage.on_event_ice_disconnect()
+            Output::Event(e) => {
+                match e {
+                    Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
+                        // First handle connection level close
+                        self.report_connection_closed();
+                        // Next handle the Stage specific close
+                        self.stage.on_event_ice_disconnect()
+                    }
+                    Event::ChannelOpen(channel_id, name) => {
+                        tracing::trace!(
+                            target: LOG_TARGET,
+                            // connection_id = ?self.connection_id,
+                            ?channel_id,
+                            ?name,
+                            "channel opened",
+                        );
+                        // Use the waker to notify the PollDataChannel that the channel is open
+                        // (ready to read and write data)
+                        // This needs to be a waker, as the PollDataChannel can't have
+                        // Receiver<> in it's state (must be :Clone).
+                        if let Some(w) = self.channel_wakers.get(&channel_id) {
+                            w.open.wake()
+                        }
+
+                        // Call the Stage specific handler for Channel Open
+                        // TODO: Are there any stage specific action besides sending signal to
+                        // AsycRead/Write in the PollDataChannel?
+                        self.stage.on_event_channel_open(channel_id, name)
+                    }
+                    Event::ChannelData(data) => {
+                        // 1) data goes in the channel read_buffer for PollDataChannel
+                        // TODO: Figure out how to get the data here to PollDataChannel::read_buffer
+                        // self.channel(&data.id).set_read_buffer(&data);
+
+                        // 2) Wake the PollDataChannel
+                        self.channel_wakers.get(&data.id).map(|w| w.new_data.wake());
+
+                        // wait on the reply handle to reply with data
+                        // futures::channel::mpsc::Receiver<ChannelData>
+                        // how do I get the mpsc channel in the first place?
+                        // mpsc needs to be set up when the PollDataChannel is created
+                        // PollDataChannel is created from Stream::new
+                        // Stream::new is called from Connection::new_stream_from_data_channel_id
+
+                        let maybe_rx = self.channel_data_rx.get(&data.id);
+
+                        match self.channel_data_rx.get(&data.id) {
+                            Some(rx) => match rx.lock().unwrap().try_next() {
+                                Ok(Some(ready)) => {
+                                    ready.response.send(data.data.clone()).unwrap();
+                                }
+                                Ok(None) => {
+                                    tracing::debug!("No data to send to PollDataChannel");
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Failed to send data to PollDataChannel: {:?}",
+                                        e
+                                    );
+                                }
+                            },
+                            None => {
+                                tracing::error!(
+                                    "No channel data receiver for channel_id: {:?}",
+                                    data.id
+                                );
+                            }
+                        }
+
+                        self.stage.on_event_channel_data(data)
+                    }
+                    Event::ChannelClose(channel_id) => {
+                        // Wake the PollDataChannel to actually close the channel
+                        self.channel_wakers.get(&channel_id).map(|w| w.close.wake());
+
+                        // remove the channel wakers from the wakers HashMap
+                        self.channel_wakers.remove(&channel_id);
+
+                        // Deal with the Stage specific handler for Channel Closed event
+                        self.stage.on_event_channel_close(channel_id)
+                    }
+                    Event::Connected => {
+                        let rtc = Arc::clone(&self.rtc);
+                        self.stage.on_event_connected(rtc)
+                    }
+                    event => self.stage.on_event(event),
                 }
-                Event::ChannelOpen(channel_id, name) => {
-                    // Use the waker to wake the PollDataChannel
-                    self.channel_wakers.get(&channel_id).map(|w| w.open.wake());
-
-                    // transmit on mpsc Sender to notify Connection<Open>::StreamMuxer that there is a new channel opened
-                    self.tx_ondatachannel.try_send(channel_id).unwrap();
-
-                    // Call the Stage specific handler for Channel Open
-                    self.stage.on_event_channel_open(channel_id, name)
-                }
-                Event::ChannelData(data) => {
-                    // 1) data goes in the channel read_buffer for PollDataChannel
-                    // TODO: Figure out how to get the data here to PollDataChannel::read_buffer
-                    // self.channel(&data.id).set_read_buffer(&data);
-
-                    // 2) Wake the PollDataChannel
-                    self.channel_wakers.get(&data.id).map(|w| w.new_data.wake());
-
-                    // wait the reply handle to reply with data
-                    // futures::channel::mpsc::Receiver<ChannelData>
-                    // how do I get the mpsc channel in the first place?
-                    // mpsc needs to be set up when the PollDataChannel is created
-                    // PollDataChannel is created from Stream::new
-                    // Stream::new is called from Connection::new_stream_from_data_channel_id
-
-                    self.stage.on_event_channel_data(data)
-                }
-                Event::ChannelClose(channel_id) => {
-                    // Wake the PollDataChannel to actually close the channel
-                    self.channel_wakers.get(&channel_id).map(|w| w.close.wake());
-
-                    // remove the channel wakers from the wakers HashMap
-                    self.channel_wakers.remove(&channel_id);
-
-                    // Deal with the Stage specific handler for Channel Closed event
-                    self.stage.on_event_channel_close(channel_id)
-                }
-                Event::Connected => {
-                    let rtc = Arc::clone(&self.rtc);
-                    self.stage.on_event_connected(rtc)
-                }
-                event => self.stage.on_event(event),
-            },
+            }
         }
     }
 }
@@ -317,12 +355,9 @@ impl<Stage> Connection<Stage> {
 
     /// New Stream from Data Channel ID
     fn new_stream_from_data_channel_id(&mut self, channel_id: ChannelId) -> Stream {
-        // get conn from *self
-
         let (stream, drop_listener, mut rx, reply_rx) =
             Stream::new(channel_id, RtcDataChannelState::Open, self.rtc.clone()).unwrap();
 
-        // wait on the rx for the wakers
         match rx.try_next() {
             Ok(Some(wakers)) => {
                 // Track the waker and the drop listener for this channel
@@ -366,7 +401,6 @@ impl<Stage> StreamMuxer for Connection<Stage> {
         match ready!(self.rx_ondatachannel.poll_next_unpin(cx)) {
             Some(channel_id) => {
                 let stream = self.new_stream_from_data_channel_id(channel_id);
-                // return the stream
                 Poll::Ready(Ok(stream))
             }
             None => {

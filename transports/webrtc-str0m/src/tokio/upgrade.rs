@@ -50,7 +50,7 @@ pub(crate) async fn inbound(
         rtc.clone(),
         udp_manager.lock().unwrap().socket(),
         source,
-        Opening::new(noise_channel_id),
+        Opening::new(),
     )));
 
     // This new Connection needs to be added to udp_manager.addr_conns
@@ -99,14 +99,14 @@ pub(crate) async fn inbound(
         return Err(Error::Disconnected);
     };
 
-    let (noise_stream, drop_listener, rx, ready_rx) =
+    let (noise_stream, drop_listener, waker_rx, ready_rx) =
         Stream::new(noise_channel_id, RtcDataChannelState::Open, rtc)
             .map_err(|_| Error::StreamCreationFailed)?;
 
     // We don't care when the noise streamis closed
     drop(drop_listener);
     // We also don't wake the Connection::StreamMuxer for the Noise channel
-    drop(rx);
+    drop(waker_rx);
     drop(ready_rx);
 
     let client_fingerprint: crate::tokio::Fingerprint =

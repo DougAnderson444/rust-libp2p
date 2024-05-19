@@ -56,7 +56,7 @@ pub struct ReadReady {
     /// The channel id of the channel that is ready to read.
     pub channel_id: ChannelId,
     /// The reply channel to send the read_buffer back to the [PollDataChannel].
-    pub response: futures::channel::oneshot::Sender<ChannelData>,
+    pub response: futures::channel::oneshot::Sender<Vec<u8>>,
 }
 
 impl PollDataChannel {
@@ -146,7 +146,7 @@ impl PollDataChannel {
                 // open_waker register(cx.waker());
                 // We need to signal to the connection that we are waiting for the channel to open.
                 self.wakers.open.register(cx.waker());
-                return Poll::Pending;
+                Poll::Pending
             }
             RtcDataChannelState::Closing | RtcDataChannelState::Closed => {
                 Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
@@ -195,14 +195,14 @@ impl AsyncRead for PollDataChannel {
         // In which case they will reply with a Vec<u8> and we will return Poll::Ready(Ok(len))
 
         // Handle empty scenario
-        if input.data.is_empty() {
+        if input.is_empty() {
             this.wakers.new_data.register(cx.waker());
             return Poll::Pending;
         }
 
         let mut read_buffer = this.read_buffer.lock().unwrap();
 
-        if read_buffer.len() + input.data.len() > MAX_MSG_LEN {
+        if read_buffer.len() + input.len() > MAX_MSG_LEN {
             this.overloaded.store(true, Ordering::SeqCst);
             tracing::warn!("Remote is overloading us with messages, resetting stream",);
             return Poll::Ready(Err(io::Error::new(
@@ -211,7 +211,7 @@ impl AsyncRead for PollDataChannel {
             )));
         }
 
-        read_buffer.extend_from_slice(&input.data);
+        read_buffer.extend_from_slice(&input);
 
         // Ensure that we:
         // - at most return what the caller can read (`buf.len()`)

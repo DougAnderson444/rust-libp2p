@@ -6,21 +6,16 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{prelude::*, task::AtomicWaker};
-use libp2p_webrtc_utils::MAX_MSG_LEN;
+use futures::prelude::*;
 use poll_data_channel::PollDataChannel;
 use send_wrapper::SendWrapper;
-use str0m::{
-    channel::{Channel, ChannelId},
-    Rtc,
-};
-use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
+use str0m::{channel::ChannelId, Rtc};
 
-pub use self::poll_data_channel::ReadReady;
+pub(crate) use self::poll_data_channel::ReadReady;
 
 use super::{
     channel::{ChannelWakers, RtcDataChannelState},
-    Connection, Error,
+    Error,
 };
 
 /// A substream on top of a WebRTC data channel.
@@ -43,7 +38,7 @@ impl Stream {
             Self,
             DropListener,
             futures::channel::mpsc::Receiver<ChannelWakers>,
-            futures::channel::mpsc::Receiver<ReadReady>,
+            Mutex<futures::channel::mpsc::Receiver<ReadReady>>,
         ),
         Error,
     > {
@@ -63,7 +58,7 @@ impl Stream {
             },
             SendWrapper::new(drop_listener),
             wakers_rx,
-            read_ready_rx,
+            Mutex::new(read_ready_rx),
         ))
     }
 }

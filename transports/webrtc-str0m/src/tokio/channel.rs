@@ -2,13 +2,8 @@
 //! Each Channel has an Id and a State.
 
 use futures::task::AtomicWaker;
-use libp2p_webrtc_utils::MAX_MSG_LEN;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::Context;
-use str0m::channel::{ChannelData, ChannelId};
-use tokio_util::bytes::BytesMut;
 
 /// Enum of the various types of Wakers:
 /// - new data
@@ -16,7 +11,7 @@ use tokio_util::bytes::BytesMut;
 /// - write
 /// - close
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub enum WakerType {
+pub(crate) enum WakerType {
     /// Waker for when we have new data.
     NewData,
 
