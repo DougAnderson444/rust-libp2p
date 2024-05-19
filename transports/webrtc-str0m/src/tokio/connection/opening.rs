@@ -5,18 +5,14 @@ use super::*;
 /// The Opening Connection state.
 #[derive(Debug, Clone)]
 pub struct Opening {
-    /// The Noise Channel Id
-    noise_channel_id: ChannelId,
-
     /// The state of the opening connection handshake
     handshake_state: HandshakeState,
 }
 
 impl Opening {
     /// Creates a new `Opening` state.
-    pub fn new(noise_channel_id: ChannelId) -> Self {
+    pub fn new() -> Self {
         Self {
-            noise_channel_id,
             handshake_state: HandshakeState::Closed,
         }
     }
@@ -180,40 +176,14 @@ impl Connectable for Opening {
 
     /// Progress the opening of the channel, as applicable.
     fn on_event_channel_open(&mut self, channel_id: ChannelId, name: String) -> Self::Output {
-        tracing::trace!(
-            target: LOG_TARGET,
-            // connection_id = ?self.connection_id,
-            ?channel_id,
-            ?name,
-            "channel opened",
-        );
-
-        if channel_id != self.noise_channel_id {
-            tracing::warn!(
-                target: LOG_TARGET,
-                // connection_id = ?self.connection_id,
-                ?channel_id,
-                "ignoring opened channel",
-            );
-            return OpeningEvent::None;
-        }
-
-        // TODO: no expect
-        tracing::trace!(target: LOG_TARGET, "send initial noise handshake");
-
-        // let Stage::Opened { mut context } = std::mem::replace(&mut self.state, State::Poisoned)
-        // else {
-        //     return Err(Error::InvalidState);
-        // };
-        //
-        // let HandshakeState::Opened {} =
-        //     std::mem::replace(&mut self.handshake, HandshakeState::Opened {});
+        // No Opening specific logic for channel open
 
         OpeningEvent::None
     }
 
     /// When Opening, ChannelData should be the Noise Handshake,
-    /// which is handled by the Noise Protocol during `upgrade::inbound` or `upgrade::outbound`?
+    /// so data needs to be passed to the PollDataChannel AsyncRead/Write so the
+    /// Noise Protocol has it during `upgrade::inbound` or `upgrade::outbound`
     fn on_event_channel_data(&mut self, _data: ChannelData) -> Self::Output {
         tracing::trace!(
             target: LOG_TARGET,
