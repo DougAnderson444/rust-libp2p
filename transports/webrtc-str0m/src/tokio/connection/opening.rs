@@ -38,6 +38,8 @@ impl Connection<Opening> {
     ) -> Self {
         // Create a channel for sending datagrams to the connection event handler.
         let (relay_dgram, dgram_rx) = mpsc::channel(DATAGRAM_BUFFER_SIZE);
+        let (tx_ondatachannel, rx_ondatachannel) = futures::channel::mpsc::channel(1);
+
         let local_address = socket.local_addr().unwrap();
         Self {
             rtc,
@@ -48,6 +50,8 @@ impl Connection<Opening> {
             dgram_rx,
             peer_address: PeerAddress(source),
             local_address,
+            tx_ondatachannel,
+            rx_ondatachannel,
         }
     }
 
@@ -63,6 +67,8 @@ impl Connection<Opening> {
             peer_address: self.peer_address,
             local_address: self.local_address,
             socket: self.socket,
+            tx_ondatachannel: self.tx_ondatachannel,
+            rx_ondatachannel: self.rx_ondatachannel,
             stage: Open::new(OpenConfig {
                 peer_id: config.peer_id,
                 handshake_state: config.handshake_state,

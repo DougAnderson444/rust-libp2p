@@ -2,6 +2,8 @@
 
 use super::*;
 
+use futures::channel::mpsc;
+
 /// The Open Connection state.
 #[derive(Debug)]
 pub struct Open {
@@ -14,6 +16,7 @@ pub struct Open {
 impl Open {
     /// Creates a new `Open` state.
     pub fn new(config: OpenConfig) -> Self {
+        // An ondatachannel Future enables us to poll for incoming data channel events in StreamMuxer::poll_inbound
         Self {
             peer: config.peer_id,
             handshake_state: config.handshake_state,

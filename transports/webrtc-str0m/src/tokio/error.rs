@@ -61,4 +61,10 @@ pub enum Error {
     /// Lock poisoned
     #[error("lock poisoned")]
     LockPoisoned,
+
+    #[error("channel creation failed")]
+    StreamCreationFailed,
+
+    #[error("Noise handshake failed")]
+    NoiseHandshakeFailed,
 }

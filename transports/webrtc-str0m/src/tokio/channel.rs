@@ -11,7 +11,7 @@ use str0m::channel::{ChannelData, ChannelId};
 use tokio_util::bytes::BytesMut;
 
 /// Data Channel to keep track of identifier and state.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DataChannel {
     /// Channel ID.
     channel_id: ChannelId,
@@ -56,8 +56,21 @@ pub enum WakerType {
     Write,
 }
 
+/// Wakers for the different types of wakers
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ChannelWakers {
+    /// Waker for when we have new data.
+    pub(crate) new_data: Arc<AtomicWaker>,
+    /// Waker for when we are waiting for the DC to be opened.
+    pub(crate) open: Arc<AtomicWaker>,
+    /// Waker for when we are waiting for the DC to be closed.
+    pub(crate) close: Arc<AtomicWaker>,
+    /// Waker for when we are waiting for the DC to be written to.
+    pub(crate) write: Arc<AtomicWaker>,
+}
+
 /// Waker Struct for the different types of wakers
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Waker {
     /// Waker
     waker: Arc<AtomicWaker>,

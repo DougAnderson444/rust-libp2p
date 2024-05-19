@@ -1,5 +1,6 @@
 //! Upgrades new connections with Noise Protocol.
 
+use crate::tokio::channel::RtcDataChannelState;
 use crate::tokio::connection::OpenConfig;
 use crate::tokio::{
     connection::{Connectable, Connection, HandshakeState, Opening, OpeningEvent},
@@ -98,7 +99,10 @@ pub(crate) async fn inbound(
         return Err(Error::Disconnected);
     };
 
-    let (noise_stream, drop_listener) = Stream::new(noise_channel_id, Arc::clone(&connection))?;
+    let (noise_stream, drop_listener) =
+        Stream::new(noise_channel_id, RtcDataChannelState::Open, rtc)
+            .map_err(|_| Error::StreamCreationFailed)?;
+
     // We don't care when the noise streamis closed
     drop(drop_listener);
 
@@ -111,7 +115,8 @@ pub(crate) async fn inbound(
         client_fingerprint.into(),
         *remote_fingerprint,
     )
-    .await?;
+    .await
+    .map_err(|_| Error::NoiseHandshakeFailed)?;
 
     let handshake_state = HandshakeState::Opened { remote_fingerprint };
 

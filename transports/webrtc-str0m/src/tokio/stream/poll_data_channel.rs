@@ -1,85 +1,129 @@
 use std::cmp::min;
 use std::io;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use futures::task::AtomicWaker;
 use futures::{AsyncRead, AsyncWrite};
 use libp2p_webrtc_utils::MAX_MSG_LEN;
-use str0m::channel::ChannelId;
-use str0m::{Rtc, RtcError};
+use str0m::channel::{ChannelData, ChannelId};
+use str0m::Rtc;
 use tokio_util::bytes::BytesMut;
 
-use super::super::connection::Connection;
-use crate::tokio::channel::{RtcDataChannelState, Waker, WakerType};
+use crate::tokio::channel::{ChannelWakers, RtcDataChannelState, WakerType};
 use crate::tokio::Error;
 
 /// [`PollDataChannel`] is a wrapper around around [`Rtc`], [`ChannelId`], and [`Connection`] which are needed to read and write, and thenit also implements [`AsyncRead`] and [`AsyncWrite`] to satify libp2p.
 // let channel = Arc::new(rtc.channel(*id).unwrap()).unwrap().write(data)
 #[derive(Debug, Clone)]
 pub(crate) struct PollDataChannel {
-    /// Connection rtc.poll_output gives us incoming data
-    connection: Arc<Mutex<Connection>>,
-    /// Rtc + ChannelId = Channel.write() for outgoing data
+    /// ChannelId is needed for: Rtc + ChannelId = Channel.write() for outgoing data
     channel_id: ChannelId,
+
+    /// str0m Rtc instance for writing
+    rtc: Arc<Mutex<Rtc>>,
+
+    /// Channel state.
+    state: RtcDataChannelState,
+
+    /// Wakers for this [DataChannel].
+    wakers: ChannelWakers,
+
+    /// Read Buffer is where the incoming data is stored.
+    read_buffer: Arc<Mutex<BytesMut>>,
+
+    /// Whether we've been overloaded with data by the remote.
+    ///
+    /// This is set to `true` in case `read_buffer` overflows,
+    /// i.e. the remote is sending us messages faster than we can read them.
+    /// In that case, we return an [`std::io::Error`] from [`AsyncRead`]
+    /// or [`AsyncWrite`], depending which one gets called earlier.
+    /// Failing these will (very likely), cause the application developer
+    /// to drop the stream which resets it.
+    overloaded: Arc<AtomicBool>,
 }
 
 impl PollDataChannel {
     /// Create a new [`PollDataChannel`] that creates and wires up the necessary wakers to the
     /// pollers for the given channel id.
     pub(crate) fn new(
-        channel_id: str0m::channel::ChannelId,
-        connection: Arc<Mutex<Connection>>,
+        channel_id: ChannelId,
+        state: RtcDataChannelState,
+        rtc: Arc<Mutex<Rtc>>,
     ) -> Result<Self, Error> {
-        // The constructor sets up this channel to monitor:
-        // - When the channel is ready to read or write
-        // - Wake when then is new data to read
-        // - Wake then there is new data to write
-        // - Wake when the channel is to close
+        // We purposely don't use `with_capacity` so we don't eagerly allocate `MAX_READ_BUFFER` per stream.
+        let read_buffer = Arc::new(Mutex::new(BytesMut::new()));
+        let overloaded = Arc::new(AtomicBool::new(false));
 
-        // In the connection.channels HashMap, we set the Channel.open_waker to the open_waker
-        // When the Event::ChannelOpen occurs, we wake the open_waker
-        connection
-            .lock()
-            .unwrap()
-            .channels()
-            .get_mut(&channel_id)
-            .ok_or(Error::ChannelDoesntExist)?
-            .set_wakers();
+        // TODO: Send Wakers to Connection struct (via Sender?)
+        let wakers = ChannelWakers::default();
 
         Ok(Self {
-            connection,
             channel_id,
+            rtc,
+            state,
+            wakers,
+            read_buffer,
+            overloaded,
         })
     }
 
-    /// Returns the [RtcDataChannelState] of the [RtcDataChannel]
-    fn ready_state(&self) -> RtcDataChannelState {
-        // Pull the RtcDataChannelState from the connection.channels(channel_id)
-        self.connection
-            .lock()
-            .unwrap()
-            .channels()
-            .get(&self.channel_id)
-            .unwrap()
-            .state()
+    /// Get the channel ID.
+    pub fn channel_id(&self) -> ChannelId {
+        self.channel_id
     }
 
+    /// Get the channel state.
+    pub fn state(&self) -> RtcDataChannelState {
+        self.state.clone()
+    }
+
+    /// Returns the [RtcDataChannelState] of the [RtcDataChannel]
+    fn state_mut(&mut self) -> &mut RtcDataChannelState {
+        // Pull the RtcDataChannelState from the connection.channels(channel_id)
+        &mut self.state
+    }
+
+    /// Wake the Waker.
+    pub fn wake(&self, waker_type: WakerType) {
+        match waker_type {
+            WakerType::NewData => self.wakers.new_data.wake(),
+            WakerType::Open => self.wakers.open.wake(),
+            WakerType::Close => self.wakers.close.wake(),
+            WakerType::Write => self.wakers.write.wake(),
+        }
+    }
+
+    /// Set the value of read_buffer.
+    pub fn set_read_buffer(&self, input: &ChannelData) {
+        let mut read_buffer = self.read_buffer.lock().unwrap();
+
+        if read_buffer.len() + input.data.len() > MAX_MSG_LEN {
+            self.overloaded.store(true, Ordering::SeqCst);
+            tracing::warn!("Remote is overloading us with messages, resetting stream",);
+            return;
+        }
+
+        read_buffer.extend_from_slice(&input.data.to_vec());
+    }
+
+    /// Get the value of read_buffer.
+    pub fn read_buffer(&self) -> Arc<Mutex<BytesMut>> {
+        self.read_buffer.clone()
+    }
+
+    /// Sets the state of the [DataChannel].
+    pub(crate) fn set_state(&mut self, state: RtcDataChannelState) {
+        self.state = state;
+    }
     /// Whether the data channel is ready for reading or writing.
     fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        match self.ready_state() {
+        match self.state_mut() {
             RtcDataChannelState::InboundOpening | RtcDataChannelState::OutboundOpening => {
                 // open_waker register(cx.waker());
-                self.connection
-                    .lock()
-                    .unwrap()
-                    .channels()
-                    .get_mut(&self.channel_id)
-                    .unwrap()
-                    .register_waker(cx, WakerType::Open);
+                // We need to signal to the connection that we are waiting for the channel to open.
+                self.wakers.open.register(cx.waker());
                 return Poll::Pending;
             }
             RtcDataChannelState::Closing | RtcDataChannelState::Closed => {
@@ -87,11 +131,6 @@ impl PollDataChannel {
             }
             RtcDataChannelState::Open => Poll::Ready(Ok(())),
         }
-    }
-
-    /// Get this mutable connection
-    fn connection(&mut self) -> MutexGuard<Connection> {
-        self.connection.lock().unwrap()
     }
 }
 
@@ -107,15 +146,13 @@ impl AsyncRead for PollDataChannel {
 
         // Get read_buffer
         let chid = this.channel_id;
-        let read_buffer = this.connection().channel(&chid).read_buffer();
+        let read_buffer = this.read_buffer();
 
         let mut read_buffer = read_buffer.lock().unwrap();
 
         if read_buffer.is_empty() {
-            // Register WakerType::NewData with cx.waker()
-            this.connection()
-                .channel(&chid)
-                .register_waker(cx, WakerType::NewData);
+            this.wakers.new_data.register(cx.waker());
+
             return Poll::Pending;
         }
 
@@ -145,8 +182,7 @@ impl AsyncWrite for PollDataChannel {
         // TODO: Buffer data?
 
         // write data to the channel
-        let rtc = this.connection().rtc();
-        let mut rtc = rtc.lock().unwrap();
+        let mut rtc = this.rtc.lock().unwrap();
         let mut channel = rtc.channel(this.channel_id).unwrap();
         let binary = true;
         match channel.write(binary, buf) {
@@ -167,22 +203,17 @@ impl AsyncWrite for PollDataChannel {
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
-        if this.ready_state() == RtcDataChannelState::Closed {
+        if this.state() == RtcDataChannelState::Closed {
             return Poll::Ready(Ok(()));
         }
 
-        if this.ready_state() == RtcDataChannelState::Closing {
-            let rtc = this.connection().rtc();
-            let mut rtc = rtc.lock().unwrap();
+        if this.state() == RtcDataChannelState::Closing {
+            let mut rtc = this.rtc.lock().unwrap();
             rtc.direct_api().close_data_channel(this.channel_id);
         }
 
-        let channel_id = this.channel_id.clone();
-
         // Register WakerType::Close with cx.waker()
-        this.connection()
-            .channel(&channel_id)
-            .register_waker(cx, WakerType::Close);
+        this.wakers.close.register(cx.waker());
 
         Poll::Pending
     }

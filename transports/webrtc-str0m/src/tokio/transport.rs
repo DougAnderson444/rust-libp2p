@@ -75,7 +75,8 @@ impl libp2p_core::Transport for Transport {
             parse_webrtc_listen_addr(&addr).ok_or(TransportError::MultiaddrNotSupported(addr))?;
 
         let udp_manager = Arc::new(Mutex::new(
-            UDPManager::with_address(addr).map_err(|e| TransportError::Other(Error::Io(e)))?,
+            UDPManager::with_address(addr)
+                .map_err(|e| TransportError::Other(Error::Disconnected))?,
         ));
 
         self.listeners.push(

@@ -92,7 +92,7 @@ impl UDPManager {
     }
 
     /// Creates a new `UDPManager` with the given address.
-    pub(crate) fn with_address(addr: SocketAddr) -> Result<Self, std::io::Error> {
+    pub(crate) fn with_address(addr: SocketAddr) -> Result<Self, Error> {
         let socket = match addr.is_ipv4() {
             true => {
                 let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(socket2::Protocol::UDP))?;

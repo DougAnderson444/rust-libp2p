@@ -15,6 +15,7 @@ pub(crate) use self::opening::Opening;
 use crate::tokio::fingerprint::Fingerprint;
 use crate::tokio::UdpSocket;
 
+use std::task::ready;
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -23,6 +24,7 @@ use std::{
     time::Instant,
 };
 
+use futures::StreamExt;
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
 use libp2p_identity::PeerId;
 use str0m::{
@@ -173,31 +175,25 @@ pub struct Connection<Stage = Opening> {
 
     /// This peer's local address.
     local_address: SocketAddr,
+
+    /// Inbound Data Channels, a future that notifies the StreamMuxer that there are incoming channels ready
+    pub(crate) rx_ondatachannel: futures::channel::mpsc::Receiver<ChannelId>,
+
+    /// Transmitter to notify StreamMuxer that there is a new channel opened
+    tx_ondatachannel: futures::channel::mpsc::Sender<ChannelId>,
 }
 
 impl<Stage> Unpin for Connection<Stage> {}
 
 /// Implementations that apply to both [Stages].
 impl<Stage: Connectable> Connection<Stage> {
-    /// Getter for Rtc
-    pub fn rtc(&self) -> Arc<Mutex<Rtc>> {
-        Arc::clone(&self.rtc)
-    }
-
-    /// Getter for all channels
-    pub fn channels(&mut self) -> &mut HashMap<ChannelId, DataChannel> {
-        &mut self.channels
-    }
-
-    /// Get a mutable Channel by its ID
-    pub fn channel(&mut self, channel_id: &ChannelId) -> &mut DataChannel {
-        self.channels.get_mut(channel_id).expect("channel to exist")
-    }
-
     /// Receive a datagram from the socket and process it according to the stage of the connection.
     pub fn dgram_recv(&mut self, buf: &[u8]) -> Result<(), Error> {
         // use Open or Opening depending on the state
-        Ok(self.relay_dgram.try_send(buf.to_vec())?)
+        Ok(self
+            .relay_dgram
+            .try_send(buf.to_vec())
+            .map_err(|_| Error::Disconnected)?)
     }
 
     /// Report the connection as closed.
@@ -266,6 +262,9 @@ impl<Stage: Connectable> Connection<Stage> {
                     // Trigger ready in PollDataChannel.
                     self.channel(&channel_id).wake(WakerType::Open);
 
+                    // transmit on mpsc Sender to notify Connection<Open>::StreamMuxer that there is a new channel opened
+                    self.tx_ondatachannel.try_send(channel_id).unwrap();
+
                     // Call the Stage specific handler for Channel Open
                     self.stage.on_event_channel_open(channel_id, name)
                 }
@@ -302,18 +301,71 @@ impl<Stage: Connectable> Connection<Stage> {
     }
 }
 
-/// WebRTC native multiplexing
+impl<Stage> Connection<Stage> {
+    /// Getter for Rtc
+    pub fn rtc(&self) -> Arc<Mutex<Rtc>> {
+        Arc::clone(&self.rtc)
+    }
+
+    /// Getter for all channels
+    pub fn channels(&mut self) -> &mut HashMap<ChannelId, DataChannel> {
+        &mut self.channels
+    }
+
+    /// Get a mutable Channel by its ID
+    pub fn channel(&mut self, channel_id: &ChannelId) -> &mut DataChannel {
+        self.channels.get_mut(channel_id).expect("channel to exist")
+    }
+
+    /// New Stream from Data Channel ID
+    fn new_stream_from_data_channel_id(&self, channel_id: ChannelId) -> Stream {
+        // get conn from *self
+
+        let (stream, drop_listener) = Stream::new(
+            channel_id,
+            self.channels.get(&channel_id).unwrap().state(),
+            self.rtc.clone(),
+        )
+        .unwrap();
+
+        // // self.channels.get_mut(&channel_id).unwrap().set_stream(stream);
+        // drop_listener
+        //     .lock()
+        //     .unwrap()
+        //     .set_drop_listener(self.relay_dgram.clone());
+        stream
+    }
+}
+
+/// WebRTC native multiplexing of [Open] [Connection]s.
 /// Allow users to open their substreams
-impl StreamMuxer for Connection<Opening> {
+impl<Stage> StreamMuxer for Connection<Stage> {
     type Substream = Stream;
     type Error = Error;
 
     fn poll_inbound(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<Self::Substream, Self::Error>> {
         // wait for inbound data channels to be ready
-        todo!()
+        match ready!(self.rx_ondatachannel.poll_next_unpin(cx)) {
+            Some(channel_id) => {
+                // get the channel.id from self.channels
+                let channel = self.channels.get(&channel_id).unwrap();
+
+                // get Connection from Pin pointer: Pin<&mut Connection<Open>> into Arc<Mutex<Connection<Open>>>
+
+                // create a new Stream with the channel and self into Arc<Mutex<self>>
+                let stream = self.new_stream_from_data_channel_id(channel_id);
+                // return the stream
+                std::task::Poll::Ready(Ok(stream))
+            }
+            None => {
+                // No more channels to poll
+                tracing::debug!("`Sender` for inbound data channels has been dropped");
+                std::task::Poll::Ready(Err(Error::Disconnected))
+            }
+        }
     }
 
     fn poll_outbound(
