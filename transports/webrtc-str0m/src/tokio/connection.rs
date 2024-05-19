@@ -13,9 +13,14 @@ mod opening;
 pub(crate) use self::open::{Open, OpenConfig};
 pub(crate) use self::opening::Opening;
 use crate::tokio::fingerprint::Fingerprint;
+use crate::tokio::stream::ReadReady;
 use crate::tokio::UdpSocket;
 
-use std::task::ready;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
+use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
+use libp2p_identity::PeerId;
+use std::task::{ready, Context, Poll, Waker};
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -23,13 +28,9 @@ use std::{
     sync::{Arc, Mutex},
     time::Instant,
 };
-
-use futures::StreamExt;
-use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
-use libp2p_identity::PeerId;
 use str0m::{
     channel::{ChannelData, ChannelId},
-    net::{DatagramSend, Protocol as Str0mProtocol, Receive},
+    net::{Protocol as Str0mProtocol, Receive},
     Event, IceConnectionState, Input, Output, Rtc,
 };
 use tokio::sync::mpsc::Sender;
@@ -37,8 +38,8 @@ use tokio::sync::mpsc::{self, Receiver};
 
 use crate::tokio::Error;
 
-use super::channel::{DataChannel, RtcDataChannelState, WakerType};
-use super::stream::Stream;
+use super::channel::{ChannelWakers, RtcDataChannelState, WakerType};
+use super::stream::{DropListener, Stream};
 
 /// The size of the buffer for incoming datagrams.
 const DATAGRAM_BUFFER_SIZE: usize = 1024;
@@ -159,7 +160,10 @@ pub struct Connection<Stage = Opening> {
     socket: Arc<UdpSocket>,
 
     /// The Channels associated with the Connection
-    channels: HashMap<ChannelId, DataChannel>,
+    channel_wakers: HashMap<ChannelId, ChannelWakers>,
+
+    /// [ReadReady] channel data receivers for each channel
+    channel_data_rx: HashMap<ChannelId, futures::channel::mpsc::Receiver<ReadReady>>,
 
     /// Rtc object associated with the connection.
     rtc: Arc<Mutex<Rtc>>,
@@ -181,6 +185,12 @@ pub struct Connection<Stage = Opening> {
 
     /// Transmitter to notify StreamMuxer that there is a new channel opened
     tx_ondatachannel: futures::channel::mpsc::Sender<ChannelId>,
+
+    /// A list of futures, which, once completed, signal that a [`Stream`] has been dropped.
+    drop_listeners: FuturesUnordered<DropListener>,
+
+    /// Is set when there are no drop listeners,
+    no_drop_listeners_waker: Option<Waker>,
 }
 
 impl<Stage> Unpin for Connection<Stage> {}
@@ -253,14 +263,8 @@ impl<Stage: Connectable> Connection<Stage> {
                     self.stage.on_event_ice_disconnect()
                 }
                 Event::ChannelOpen(channel_id, name) => {
-                    // Create, save a new Channel, set the state to Open
-                    self.channels.insert(
-                        channel_id,
-                        DataChannel::new(channel_id, RtcDataChannelState::Open),
-                    );
-
-                    // Trigger ready in PollDataChannel.
-                    self.channel(&channel_id).wake(WakerType::Open);
+                    // Use the waker to wake the PollDataChannel
+                    self.channel_wakers.get(&channel_id).map(|w| w.open.wake());
 
                     // transmit on mpsc Sender to notify Connection<Open>::StreamMuxer that there is a new channel opened
                     self.tx_ondatachannel.try_send(channel_id).unwrap();
@@ -270,25 +274,29 @@ impl<Stage: Connectable> Connection<Stage> {
                 }
                 Event::ChannelData(data) => {
                     // 1) data goes in the channel read_buffer for PollDataChannel
-                    self.channel(&data.id).set_read_buffer(&data);
+                    // TODO: Figure out how to get the data here to PollDataChannel::read_buffer
+                    // self.channel(&data.id).set_read_buffer(&data);
 
                     // 2) Wake the PollDataChannel
-                    self.channel(&data.id).wake(WakerType::NewData);
+                    self.channel_wakers.get(&data.id).map(|w| w.new_data.wake());
+
+                    // wait the reply handle to reply with data
+                    // futures::channel::mpsc::Receiver<ChannelData>
+                    // how do I get the mpsc channel in the first place?
+                    // mpsc needs to be set up when the PollDataChannel is created
+                    // PollDataChannel is created from Stream::new
+                    // Stream::new is called from Connection::new_stream_from_data_channel_id
 
                     self.stage.on_event_channel_data(data)
                 }
                 Event::ChannelClose(channel_id) => {
-                    // 1) Set the channel state to Closed
-                    self.channel(&channel_id)
-                        .set_state(RtcDataChannelState::Closed);
+                    // Wake the PollDataChannel to actually close the channel
+                    self.channel_wakers.get(&channel_id).map(|w| w.close.wake());
 
-                    // 2) Wake the PollDataChannel to actually close the channel
-                    self.channel(&channel_id).wake(WakerType::Close);
+                    // remove the channel wakers from the wakers HashMap
+                    self.channel_wakers.remove(&channel_id);
 
-                    // remove the channel from the channels HashMap
-                    self.channels.remove(&channel_id);
-
-                    // 3) Deal with the Stage specific handler for Channel Closed event
+                    // Deal with the Stage specific handler for Channel Closed event
                     self.stage.on_event_channel_close(channel_id)
                 }
                 Event::Connected => {
@@ -307,32 +315,39 @@ impl<Stage> Connection<Stage> {
         Arc::clone(&self.rtc)
     }
 
-    /// Getter for all channels
-    pub fn channels(&mut self) -> &mut HashMap<ChannelId, DataChannel> {
-        &mut self.channels
-    }
-
-    /// Get a mutable Channel by its ID
-    pub fn channel(&mut self, channel_id: &ChannelId) -> &mut DataChannel {
-        self.channels.get_mut(channel_id).expect("channel to exist")
-    }
-
     /// New Stream from Data Channel ID
-    fn new_stream_from_data_channel_id(&self, channel_id: ChannelId) -> Stream {
+    fn new_stream_from_data_channel_id(&mut self, channel_id: ChannelId) -> Stream {
         // get conn from *self
 
-        let (stream, drop_listener) = Stream::new(
-            channel_id,
-            self.channels.get(&channel_id).unwrap().state(),
-            self.rtc.clone(),
-        )
-        .unwrap();
+        let (stream, drop_listener, mut rx, reply_rx) =
+            Stream::new(channel_id, RtcDataChannelState::Open, self.rtc.clone()).unwrap();
 
-        // // self.channels.get_mut(&channel_id).unwrap().set_stream(stream);
-        // drop_listener
-        //     .lock()
-        //     .unwrap()
-        //     .set_drop_listener(self.relay_dgram.clone());
+        // wait on the rx for the wakers
+        match rx.try_next() {
+            Ok(Some(wakers)) => {
+                // Track the waker and the drop listener for this channel
+                self.channel_wakers.insert(channel_id, wakers);
+                // The Stream also gives us the mpsc::Receiver<ReadReady>
+                // to send data to the PollDataChannel, we need to store this
+                // in self so we can rx.try_next() to know when to reply
+                // with the data once the waker as woken the; PollDataChannel poller
+                self.channel_data_rx.insert(channel_id, reply_rx);
+            }
+            Ok(None) => {
+                tracing::debug!("Channel sent no wakers, that's weird");
+            }
+            Err(e) => {
+                tracing::error!("Failed to receive wakers from PollDataChanell: {:?}", e);
+            }
+        }
+
+        // Track the drop listener
+        self.drop_listeners.push(drop_listener);
+
+        // Wake .poll()
+        if let Some(waker) = self.no_drop_listeners_waker.take() {
+            waker.wake()
+        }
         stream
     }
 }
@@ -346,46 +361,51 @@ impl<Stage> StreamMuxer for Connection<Stage> {
     fn poll_inbound(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Self::Substream, Self::Error>> {
+    ) -> Poll<Result<Self::Substream, Self::Error>> {
         // wait for inbound data channels to be ready
         match ready!(self.rx_ondatachannel.poll_next_unpin(cx)) {
             Some(channel_id) => {
-                // get the channel.id from self.channels
-                let channel = self.channels.get(&channel_id).unwrap();
-
-                // get Connection from Pin pointer: Pin<&mut Connection<Open>> into Arc<Mutex<Connection<Open>>>
-
-                // create a new Stream with the channel and self into Arc<Mutex<self>>
                 let stream = self.new_stream_from_data_channel_id(channel_id);
                 // return the stream
-                std::task::Poll::Ready(Ok(stream))
+                Poll::Ready(Ok(stream))
             }
             None => {
                 // No more channels to poll
                 tracing::debug!("`Sender` for inbound data channels has been dropped");
-                std::task::Poll::Ready(Err(Error::Disconnected))
+                Poll::Ready(Err(Error::Disconnected))
             }
         }
     }
 
     fn poll_outbound(
         self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<Self::Substream, Self::Error>> {
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::Substream, Self::Error>> {
         todo!()
     }
 
     fn poll_close(
         self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
         todo!()
     }
 
     fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<StreamMuxerEvent, Self::Error>> {
-        todo!()
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<StreamMuxerEvent, Self::Error>> {
+        loop {
+            match ready!(self.drop_listeners.poll_next_unpin(cx)) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    tracing::debug!("a DropListener failed: {e}")
+                }
+                None => {
+                    self.no_drop_listeners_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+            }
+        }
     }
 }

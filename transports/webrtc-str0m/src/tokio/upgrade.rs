@@ -99,12 +99,15 @@ pub(crate) async fn inbound(
         return Err(Error::Disconnected);
     };
 
-    let (noise_stream, drop_listener) =
+    let (noise_stream, drop_listener, rx, ready_rx) =
         Stream::new(noise_channel_id, RtcDataChannelState::Open, rtc)
             .map_err(|_| Error::StreamCreationFailed)?;
 
     // We don't care when the noise streamis closed
     drop(drop_listener);
+    // We also don't wake the Connection::StreamMuxer for the Noise channel
+    drop(rx);
+    drop(ready_rx);
 
     let client_fingerprint: crate::tokio::Fingerprint =
         config.dtls_cert().unwrap().fingerprint().into();

@@ -45,13 +45,16 @@ impl Connection<Opening> {
             rtc,
             socket,
             stage: opening,
-            channels: HashMap::new(),
             relay_dgram,
             dgram_rx,
             peer_address: PeerAddress(source),
             local_address,
             tx_ondatachannel,
             rx_ondatachannel,
+            channel_wakers: Default::default(),
+            channel_data_rx: Default::default(),
+            drop_listeners: Default::default(),
+            no_drop_listeners_waker: Default::default(),
         }
     }
 
@@ -61,7 +64,8 @@ impl Connection<Opening> {
     pub fn open(self, config: OpenConfig) -> Connection<Open> {
         Connection {
             rtc: self.rtc,
-            channels: self.channels,
+            channel_wakers: self.channel_wakers,
+            channel_data_rx: self.channel_data_rx,
             relay_dgram: self.relay_dgram,
             dgram_rx: self.dgram_rx,
             peer_address: self.peer_address,
@@ -69,6 +73,8 @@ impl Connection<Opening> {
             socket: self.socket,
             tx_ondatachannel: self.tx_ondatachannel,
             rx_ondatachannel: self.rx_ondatachannel,
+            no_drop_listeners_waker: self.no_drop_listeners_waker,
+            drop_listeners: self.drop_listeners,
             stage: Open::new(OpenConfig {
                 peer_id: config.peer_id,
                 handshake_state: config.handshake_state,

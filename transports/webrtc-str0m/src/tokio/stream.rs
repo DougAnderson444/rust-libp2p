@@ -6,7 +6,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::prelude::*;
+use futures::{prelude::*, task::AtomicWaker};
 use libp2p_webrtc_utils::MAX_MSG_LEN;
 use poll_data_channel::PollDataChannel;
 use send_wrapper::SendWrapper;
@@ -16,7 +16,12 @@ use str0m::{
 };
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
-use super::{channel::RtcDataChannelState, Connection, Error};
+pub use self::poll_data_channel::ReadReady;
+
+use super::{
+    channel::{ChannelWakers, RtcDataChannelState},
+    Connection, Error,
+};
 
 /// A substream on top of a WebRTC data channel.
 ///
@@ -33,15 +38,32 @@ impl Stream {
         channel_id: ChannelId,
         state: RtcDataChannelState,
         rtc: Arc<Mutex<Rtc>>,
-    ) -> Result<(Self, DropListener), Error> {
-        let (inner, drop_listener) =
-            libp2p_webrtc_utils::Stream::new(PollDataChannel::new(channel_id, state, rtc)?);
+    ) -> Result<
+        (
+            Self,
+            DropListener,
+            futures::channel::mpsc::Receiver<ChannelWakers>,
+            futures::channel::mpsc::Receiver<ReadReady>,
+        ),
+        Error,
+    > {
+        let (wakers_tx, wakers_rx) = futures::channel::mpsc::channel(1);
+        let (read_ready_tx, read_ready_rx) = futures::channel::mpsc::channel(1);
+        let (inner, drop_listener) = libp2p_webrtc_utils::Stream::new(PollDataChannel::new(
+            channel_id,
+            state,
+            rtc,
+            wakers_tx,
+            read_ready_tx,
+        )?);
 
         Ok((
             Self {
                 inner, // : SendWrapper::new(inner),
             },
             SendWrapper::new(drop_listener),
+            wakers_rx,
+            read_ready_rx,
         ))
     }
 }

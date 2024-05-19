@@ -1,12 +1,11 @@
+use futures::{AsyncRead, AsyncWrite, FutureExt};
+use libp2p_webrtc_utils::MAX_MSG_LEN;
 use std::cmp::min;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-
-use futures::{AsyncRead, AsyncWrite};
-use libp2p_webrtc_utils::MAX_MSG_LEN;
 use str0m::channel::{ChannelData, ChannelId};
 use str0m::Rtc;
 use tokio_util::bytes::BytesMut;
@@ -30,7 +29,7 @@ pub(crate) struct PollDataChannel {
     /// Wakers for this [DataChannel].
     wakers: ChannelWakers,
 
-    /// Read Buffer is where the incoming data is stored.
+    /// Read Buffer is where the incoming data is stored in case it's bigger than the buffer.
     read_buffer: Arc<Mutex<BytesMut>>,
 
     /// Whether we've been overloaded with data by the remote.
@@ -42,6 +41,22 @@ pub(crate) struct PollDataChannel {
     /// Failing these will (very likely), cause the application developer
     /// to drop the stream which resets it.
     overloaded: Arc<AtomicBool>,
+
+    /// Send Waker tot he Connection event loop for triggering the waker.
+    send_wakers: futures::channel::mpsc::Sender<ChannelWakers>,
+
+    /// Used to send a signal back to the Connection to indicate we are ready to read.
+    read_ready_signal: futures::channel::mpsc::Sender<ReadReady>,
+}
+
+/// Simple struct to indicate that the channel is ready to read. Has a reply oneshot channel
+/// embedded so that [crate::tokio::Connection] can send the read_buffer back to the [PollDataChannel].
+#[derive(Debug)]
+pub struct ReadReady {
+    /// The channel id of the channel that is ready to read.
+    pub channel_id: ChannelId,
+    /// The reply channel to send the read_buffer back to the [PollDataChannel].
+    pub response: futures::channel::oneshot::Sender<ChannelData>,
 }
 
 impl PollDataChannel {
@@ -51,13 +66,18 @@ impl PollDataChannel {
         channel_id: ChannelId,
         state: RtcDataChannelState,
         rtc: Arc<Mutex<Rtc>>,
+        send_wakers: futures::channel::mpsc::Sender<ChannelWakers>,
+        read_ready_signal: futures::channel::mpsc::Sender<ReadReady>,
     ) -> Result<Self, Error> {
         // We purposely don't use `with_capacity` so we don't eagerly allocate `MAX_READ_BUFFER` per stream.
         let read_buffer = Arc::new(Mutex::new(BytesMut::new()));
         let overloaded = Arc::new(AtomicBool::new(false));
 
-        // TODO: Send Wakers to Connection struct (via Sender?)
+        // Send Wakers to Connection struct for triggering by the Event loop.
         let wakers = ChannelWakers::default();
+        if let Err(e) = send_wakers.clone().try_send(wakers.clone()) {
+            tracing::error!("Failed to send wakers to Connection: {:?}", e);
+        }
 
         Ok(Self {
             channel_id,
@@ -66,6 +86,8 @@ impl PollDataChannel {
             wakers,
             read_buffer,
             overloaded,
+            send_wakers,
+            read_ready_signal,
         })
     }
 
@@ -144,17 +166,52 @@ impl AsyncRead for PollDataChannel {
 
         futures::ready!(this.poll_ready(cx))?;
 
-        // Get read_buffer
-        let chid = this.channel_id;
-        let read_buffer = this.read_buffer();
+        // Get read_buffer.
+        // Send request (with embedded reply handle) to the Connection to get any new data.
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        let read_ready = ReadReady {
+            channel_id: this.channel_id,
+            response: tx,
+        };
 
-        let mut read_buffer = read_buffer.lock().unwrap();
+        // Send it!
+        if let Err(e) = this.read_ready_signal.try_send(read_ready) {
+            tracing::error!("Failed to send read_ready signal: {:?}", e);
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to send read_ready signal",
+            )));
+        }
 
-        if read_buffer.is_empty() {
+        // listen on rx for the data from Connection response
+        let input = futures::ready!(rx.poll_unpin(cx)).unwrap();
+
+        // There are two scenarios here:
+        // 1. We are asking the Connection if they have any data for us, and they don't.
+        // In which case they will reply with an empty Vec<u8> and we will
+        // register the waker and return Poll::Pending
+        //
+        // 2. We are asking the Connection if they have any data for us, and they do.
+        // In which case they will reply with a Vec<u8> and we will return Poll::Ready(Ok(len))
+
+        // Handle empty scenario
+        if input.data.is_empty() {
             this.wakers.new_data.register(cx.waker());
-
             return Poll::Pending;
         }
+
+        let mut read_buffer = this.read_buffer.lock().unwrap();
+
+        if read_buffer.len() + input.data.len() > MAX_MSG_LEN {
+            this.overloaded.store(true, Ordering::SeqCst);
+            tracing::warn!("Remote is overloading us with messages, resetting stream",);
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "remote overloaded us with messages",
+            )));
+        }
+
+        read_buffer.extend_from_slice(&input.data);
 
         // Ensure that we:
         // - at most return what the caller can read (`buf.len()`)
