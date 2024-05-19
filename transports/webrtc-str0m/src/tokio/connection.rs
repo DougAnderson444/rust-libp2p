@@ -279,43 +279,36 @@ impl<Stage: Connectable> Connection<Stage> {
                             w.open.wake()
                         }
 
-                        // Call the Stage specific handler for Channel Open
-                        // TODO: Are there any stage specific action besides sending signal to
-                        // AsycRead/Write in the PollDataChannel?
+                        // Call the Stage specific handler for Channel Open (if any)
                         self.stage.on_event_channel_open(channel_id, name)
                     }
                     Event::ChannelData(data) => {
-                        // 1) data goes in the channel read_buffer for PollDataChannel
-                        // TODO: Figure out how to get the data here to PollDataChannel::read_buffer
-                        // self.channel(&data.id).set_read_buffer(&data);
+                        // Data goes from this Connection
+                        // into the read_buffer for PollDataChannel for this channel_id
 
-                        // 2) Wake the PollDataChannel
-                        self.channel_wakers.get(&data.id).map(|w| w.new_data.wake());
+                        // Wake the PollDataChannel for new data
+                        if let Some(w) = self.channel_wakers.get(&data.id) {
+                            w.new_data.wake()
+                        }
 
-                        // wait on the reply handle to reply with data
-                        // futures::channel::mpsc::Receiver<ChannelData>
-                        // how do I get the mpsc channel in the first place?
-                        // mpsc needs to be set up when the PollDataChannel is created
-                        // PollDataChannel is created from Stream::new
-                        // Stream::new is called from Connection::new_stream_from_data_channel_id
-
-                        let maybe_rx = self.channel_data_rx.get(&data.id);
-
+                        // Wait on the reply handle to reply with data
                         match self.channel_data_rx.get(&data.id) {
-                            Some(rx) => match rx.lock().unwrap().try_next() {
-                                Ok(Some(ready)) => {
-                                    ready.response.send(data.data.clone()).unwrap();
+                            Some(rx) => {
+                                match rx.lock().unwrap().try_next() {
+                                    Ok(Some(ready)) => {
+                                        ready.response.send(data.data.clone()).unwrap();
+                                    }
+                                    Ok(None) => {
+                                        tracing::debug!("No data to send to PollDataChannel, sending empty data");
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Connection event loop failed to send channel data to PollDataChannel: {:?}",
+                                            e
+                                        );
+                                    }
                                 }
-                                Ok(None) => {
-                                    tracing::debug!("No data to send to PollDataChannel");
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        "Failed to send data to PollDataChannel: {:?}",
-                                        e
-                                    );
-                                }
-                            },
+                            }
                             None => {
                                 tracing::error!(
                                     "No channel data receiver for channel_id: {:?}",
