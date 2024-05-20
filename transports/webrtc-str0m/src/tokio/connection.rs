@@ -12,14 +12,15 @@ mod opening;
 
 pub(crate) use self::open::{Open, OpenConfig};
 pub(crate) use self::opening::Opening;
+use crate::tokio::channel::ReadReady;
 use crate::tokio::fingerprint::Fingerprint;
-use crate::tokio::stream::ReadReady;
 use crate::tokio::UdpSocket;
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
 use libp2p_identity::PeerId;
+use std::cell::RefCell;
 use std::task::{ready, Context, Poll, Waker};
 use std::{
     collections::HashMap,
@@ -38,7 +39,7 @@ use tokio::sync::mpsc::{self, Receiver};
 
 use crate::tokio::Error;
 
-use super::channel::{ChannelWakers, RtcDataChannelState};
+use super::channel::{ChannelDetails, ChannelWakers, RtcDataChannelState};
 use super::stream::{DropListener, Stream};
 
 /// The size of the buffer for incoming datagrams.
@@ -159,11 +160,8 @@ pub struct Connection<Stage = Opening> {
     /// Transport socket.
     socket: Arc<UdpSocket>,
 
-    /// The Channels associated with the Connection
-    channel_wakers: HashMap<ChannelId, ChannelWakers>,
-
-    /// [ReadReady] channel data receivers for each channel
-    channel_data_rx: HashMap<ChannelId, Mutex<futures::channel::mpsc::Receiver<ReadReady>>>,
+    /// Channel details by channel_id, such as wakers, data receivers, and state change receivers.
+    channel_details: HashMap<ChannelId, RefCell<ChannelDetails>>,
 
     /// Rtc object associated with the connection.
     rtc: Arc<Mutex<Rtc>>,
@@ -200,10 +198,9 @@ impl<Stage: Connectable> Connection<Stage> {
     /// Receive a datagram from the socket and process it according to the stage of the connection.
     pub fn dgram_recv(&mut self, buf: &[u8]) -> Result<(), Error> {
         // use Open or Opening depending on the state
-        Ok(self
-            .relay_dgram
+        self.relay_dgram
             .try_send(buf.to_vec())
-            .map_err(|_| Error::Disconnected)?)
+            .map_err(|_| Error::Disconnected)
     }
 
     /// Report the connection as closed.
@@ -271,45 +268,36 @@ impl<Stage: Connectable> Connection<Stage> {
                             ?name,
                             "channel opened",
                         );
+
+                        let channel_details = self.channel_details.get(&channel_id).expect(
+                            "ChannelDetails should be present in the Connection struct for the channel_id",
+                        ).try_borrow_mut().expect("ChannelDetails should be mutable");
+
                         // Use the waker to notify the PollDataChannel that the channel is open
                         // (ready to read and write data)
                         // This needs to be a waker, as the PollDataChannel can't have
                         // Receiver<> in it's state (must be :Clone).
-                        if let Some(w) = self.channel_wakers.get(&channel_id) {
-                            w.open.wake()
-                        }
+                        channel_details.wakers.open.wake();
 
-                        // Call the Stage specific handler for Channel Open (if any)
+                        // Call any Stage specific handler for Channel Open event
                         self.stage.on_event_channel_open(channel_id, name)
                     }
                     Event::ChannelData(data) => {
                         // Data goes from this Connection
                         // into the read_buffer for PollDataChannel for this channel_id
 
-                        // Wake the PollDataChannel for new data
-                        if let Some(w) = self.channel_wakers.get(&data.id) {
-                            w.new_data.wake()
-                        }
+                        let channel_details = self.channel_details.get(&data.id).expect(
+                            "ChannelDetails should be present in the Connection struct for the channel_id",
+                        ).try_borrow_mut().expect("ChannelDetails should be mutable");
+
+                        channel_details.wakers.new_data.wake();
 
                         // Wait on the reply handle to reply with data
-                        match self.channel_data_rx.get(&data.id) {
-                            Some(rx) => {
-                                match rx.lock().unwrap().try_next() {
-                                    Ok(Some(ready)) => {
-                                        ready.response.send(data.data.clone()).unwrap();
-                                    }
-                                    Ok(None) => {
-                                        tracing::debug!("No data to send to PollDataChannel, sending empty data");
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Connection event loop failed to send channel data to PollDataChannel: {:?}",
-                                            e
-                                        );
-                                    }
-                                }
+                        match channel_details.channel_data_rx.lock().unwrap().try_next() {
+                            Ok(Some(rx)) => {
+                                rx.response.send(data.data.clone()).unwrap();
                             }
-                            None => {
+                            _ => {
                                 tracing::error!(
                                     "No channel data receiver for channel_id: {:?}",
                                     data.id
@@ -320,11 +308,15 @@ impl<Stage: Connectable> Connection<Stage> {
                         self.stage.on_event_channel_data(data)
                     }
                     Event::ChannelClose(channel_id) => {
-                        // Wake the PollDataChannel to actually close the channel
-                        self.channel_wakers.get(&channel_id).map(|w| w.close.wake());
-
-                        // remove the channel wakers from the wakers HashMap
-                        self.channel_wakers.remove(&channel_id);
+                        let channel_details = self.channel_details.get(&channel_id).expect(
+                            "ChannelDetails should be present in the Connection struct for the channel_id",
+                        );
+                        {
+                            let channel_details = channel_details.borrow_mut();
+                            // Set the channel state to Closed
+                            channel_details.wakers.close.wake();
+                        }
+                        self.channel_details.remove(&channel_id);
 
                         // Deal with the Stage specific handler for Channel Closed event
                         self.stage.on_event_channel_close(channel_id)
@@ -347,19 +339,25 @@ impl<Stage> Connection<Stage> {
     }
 
     /// New Stream from Data Channel ID
-    fn new_stream_from_data_channel_id(&mut self, channel_id: ChannelId) -> Stream {
-        let (stream, drop_listener, mut rx, reply_rx) =
-            Stream::new(channel_id, RtcDataChannelState::Open, self.rtc.clone()).unwrap();
+    pub fn new_stream_from_data_channel_id(
+        &mut self,
+        channel_id: ChannelId,
+    ) -> Result<Stream, Error> {
+        let (stream, drop_listener, mut waker_rx, reply_rx, channel_state_rx) =
+            Stream::new(channel_id, RtcDataChannelState::Open, self.rtc.clone())
+                .map_err(|_| Error::StreamCreationFailed)?;
 
-        match rx.try_next() {
+        let mut channel_details = self
+            .channel_details
+            .get(&channel_id)
+            .expect("ChannelDetails should be present in the Connection struct for the channel_id")
+            .try_borrow_mut()
+            .expect("Channel details should be mutable");
+
+        match waker_rx.try_next() {
             Ok(Some(wakers)) => {
                 // Track the waker and the drop listener for this channel
-                self.channel_wakers.insert(channel_id, wakers);
-                // The Stream also gives us the mpsc::Receiver<ReadReady>
-                // to send data to the PollDataChannel, we need to store this
-                // in self so we can rx.try_next() to know when to reply
-                // with the data once the waker as woken the; PollDataChannel poller
-                self.channel_data_rx.insert(channel_id, reply_rx);
+                channel_details.wakers = wakers;
             }
             Ok(None) => {
                 tracing::debug!("Channel sent no wakers, that's weird");
@@ -369,14 +367,24 @@ impl<Stage> Connection<Stage> {
             }
         }
 
+        // The Stream also gives us the mpsc::Receiver<ReadReady>
+        // to send data to the PollDataChannel, we need to store this
+        // in self so we can rx.try_next() to know when to reply
+        // with the data once the waker as woken the; PollDataChannel poller
+        // self.channel_data_rx.insert(channel_id, reply_rx);
+
         // Track the drop listener
+        // TODO: Verify that noise channels are dropped correctly from this list
         self.drop_listeners.push(drop_listener);
+
+        // Save the channel state changes to ChannelDetails
+        channel_details.channel_state_rx = channel_state_rx;
 
         // Wake .poll()
         if let Some(waker) = self.no_drop_listeners_waker.take() {
             waker.wake()
         }
-        stream
+        Ok(stream)
     }
 }
 
@@ -393,7 +401,7 @@ impl<Stage> StreamMuxer for Connection<Stage> {
         // wait for inbound data channels to be ready
         match ready!(self.rx_ondatachannel.poll_next_unpin(cx)) {
             Some(channel_id) => {
-                let stream = self.new_stream_from_data_channel_id(channel_id);
+                let stream = self.new_stream_from_data_channel_id(channel_id)?;
                 Poll::Ready(Ok(stream))
             }
             None => {

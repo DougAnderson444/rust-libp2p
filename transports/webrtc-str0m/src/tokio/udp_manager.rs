@@ -82,12 +82,12 @@ enum NewSource {
 
 impl UDPManager {
     /// Getter for socket
-    pub fn socket(&self) -> Arc<UdpSocket> {
+    pub(crate) fn socket(&self) -> Arc<UdpSocket> {
         self.socket.clone()
     }
 
     /// Adds an address to addr_conns.
-    pub fn add_connection(&mut self, addr: SocketAddr, connection: Arc<Mutex<Connection>>) {
+    pub(crate) fn add_connection(&mut self, addr: SocketAddr, connection: Arc<Mutex<Connection>>) {
         self.addr_conns.insert(addr, connection);
     }
 

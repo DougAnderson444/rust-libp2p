@@ -11,7 +11,7 @@ use poll_data_channel::PollDataChannel;
 use send_wrapper::SendWrapper;
 use str0m::{channel::ChannelId, Rtc};
 
-pub(crate) use self::poll_data_channel::ReadReady;
+pub(crate) use super::channel::{ReadReady, StateChange};
 
 use super::{
     channel::{ChannelWakers, RtcDataChannelState},
@@ -39,17 +39,19 @@ impl Stream {
             DropListener,
             futures::channel::mpsc::Receiver<ChannelWakers>,
             Mutex<futures::channel::mpsc::Receiver<ReadReady>>,
+            Mutex<futures::channel::mpsc::Receiver<StateChange>>,
         ),
         Error,
     > {
-        let (wakers_tx, wakers_rx) = futures::channel::mpsc::channel(1);
-        let (read_ready_tx, read_ready_rx) = futures::channel::mpsc::channel(1);
+        let (send_wakers, wakers_rx) = futures::channel::mpsc::channel(1);
+        let (read_ready_signal, read_ready_rx) = futures::channel::mpsc::channel(1);
+        let (channel_state_signal, channel_state_rx) = futures::channel::mpsc::channel(1);
         let (inner, drop_listener) = libp2p_webrtc_utils::Stream::new(PollDataChannel::new(
             channel_id,
-            state,
             rtc,
-            wakers_tx,
-            read_ready_tx,
+            send_wakers,
+            read_ready_signal,
+            channel_state_signal,
         )?);
 
         Ok((
@@ -59,6 +61,7 @@ impl Stream {
             SendWrapper::new(drop_listener),
             wakers_rx,
             Mutex::new(read_ready_rx),
+            Mutex::new(channel_state_rx),
         ))
     }
 }

@@ -47,10 +47,9 @@ impl Connection<Opening> {
             local_address,
             tx_ondatachannel,
             rx_ondatachannel,
-            channel_wakers: Default::default(),
-            channel_data_rx: Default::default(),
             drop_listeners: Default::default(),
             no_drop_listeners_waker: Default::default(),
+            channel_details: Default::default(),
         }
     }
 
@@ -60,8 +59,7 @@ impl Connection<Opening> {
     pub fn open(self, config: OpenConfig) -> Connection<Open> {
         Connection {
             rtc: self.rtc,
-            channel_wakers: self.channel_wakers,
-            channel_data_rx: self.channel_data_rx,
+            channel_details: self.channel_details,
             relay_dgram: self.relay_dgram,
             dgram_rx: self.dgram_rx,
             peer_address: self.peer_address,

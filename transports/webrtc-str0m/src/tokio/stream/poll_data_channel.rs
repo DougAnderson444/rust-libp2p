@@ -1,4 +1,4 @@
-use futures::{AsyncRead, AsyncWrite, FutureExt};
+use futures::{AsyncRead, AsyncWrite, FutureExt, StreamExt};
 use libp2p_webrtc_utils::MAX_MSG_LEN;
 use std::cmp::min;
 use std::io;
@@ -10,7 +10,7 @@ use str0m::channel::{ChannelData, ChannelId};
 use str0m::Rtc;
 use tokio_util::bytes::BytesMut;
 
-use crate::tokio::channel::{ChannelWakers, RtcDataChannelState, WakerType};
+use crate::tokio::channel::{ChannelWakers, ReadReady, RtcDataChannelState, StateChange};
 use crate::tokio::Error;
 
 /// [`PollDataChannel`] is a wrapper around around [`Rtc`], [`ChannelId`], and [`Connection`] which are needed to read and write, and thenit also implements [`AsyncRead`] and [`AsyncWrite`] to satify libp2p.
@@ -42,21 +42,11 @@ pub(crate) struct PollDataChannel {
     /// to drop the stream which resets it.
     overloaded: Arc<AtomicBool>,
 
-    /// Send Waker tot he Connection event loop for triggering the waker.
-    send_wakers: futures::channel::mpsc::Sender<ChannelWakers>,
-
     /// Used to send a signal back to the Connection to indicate we are ready to read.
     read_ready_signal: futures::channel::mpsc::Sender<ReadReady>,
-}
 
-/// Simple struct to indicate that the channel is ready to read. Has a reply oneshot channel
-/// embedded so that [crate::tokio::Connection] can send the read_buffer back to the [PollDataChannel].
-#[derive(Debug)]
-pub struct ReadReady {
-    /// The channel id of the channel that is ready to read.
-    pub channel_id: ChannelId,
-    /// The reply channel to send the read_buffer back to the [PollDataChannel].
-    pub response: futures::channel::oneshot::Sender<Vec<u8>>,
+    /// State change signal.
+    channel_state_signal: futures::channel::mpsc::Sender<StateChange>,
 }
 
 impl PollDataChannel {
@@ -64,10 +54,10 @@ impl PollDataChannel {
     /// pollers for the given channel id.
     pub(crate) fn new(
         channel_id: ChannelId,
-        state: RtcDataChannelState,
         rtc: Arc<Mutex<Rtc>>,
         send_wakers: futures::channel::mpsc::Sender<ChannelWakers>,
         read_ready_signal: futures::channel::mpsc::Sender<ReadReady>,
+        channel_state_signal: futures::channel::mpsc::Sender<StateChange>,
     ) -> Result<Self, Error> {
         // We purposely don't use `with_capacity` so we don't eagerly allocate `MAX_READ_BUFFER` per stream.
         let read_buffer = Arc::new(Mutex::new(BytesMut::new()));
@@ -82,76 +72,68 @@ impl PollDataChannel {
         Ok(Self {
             channel_id,
             rtc,
-            state,
+            state: RtcDataChannelState::Opening,
             wakers,
             read_buffer,
             overloaded,
-            send_wakers,
             read_ready_signal,
+            channel_state_signal,
         })
     }
 
-    /// Get the channel ID.
-    pub fn channel_id(&self) -> ChannelId {
-        self.channel_id
-    }
+    /// Polls for state changes sent from the Connection.
+    /// Reading state is much like reading data,
+    /// Once woken, it sends a signal to the Connection to get the state
+    /// Once the state response is received, it sets the state to the new state.
+    fn poll_state_changes(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        // Send request (with embedded reply handle) to the Connection to get the state.
+        let (tx, mut rx) = futures::channel::oneshot::channel();
 
-    /// Get the channel state.
-    pub fn state(&self) -> RtcDataChannelState {
-        self.state.clone()
-    }
+        let state_change = StateChange { response: tx };
 
-    /// Returns the [RtcDataChannelState] of the [RtcDataChannel]
-    fn state_mut(&mut self) -> &mut RtcDataChannelState {
-        // Pull the RtcDataChannelState from the connection.channels(channel_id)
-        &mut self.state
-    }
-
-    /// Wake the Waker.
-    pub fn wake(&self, waker_type: WakerType) {
-        match waker_type {
-            WakerType::NewData => self.wakers.new_data.wake(),
-            WakerType::Open => self.wakers.open.wake(),
-            WakerType::Close => self.wakers.close.wake(),
-            WakerType::Write => self.wakers.write.wake(),
-        }
-    }
-
-    /// Set the value of read_buffer.
-    pub fn set_read_buffer(&self, input: &ChannelData) {
-        let mut read_buffer = self.read_buffer.lock().unwrap();
-
-        if read_buffer.len() + input.data.len() > MAX_MSG_LEN {
-            self.overloaded.store(true, Ordering::SeqCst);
-            tracing::warn!("Remote is overloading us with messages, resetting stream",);
-            return;
+        // Send it!
+        if let Err(e) = self.channel_state_signal.try_send(state_change) {
+            tracing::error!("Failed to send state_change signal: {:?}", e);
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to send state_change signal",
+            )));
         }
 
-        read_buffer.extend_from_slice(&input.data.to_vec());
+        // listen on rx for the data from Connection response
+        let new_state = futures::ready!(rx.poll_unpin(cx)).unwrap();
+
+        self.state = new_state;
+
+        Poll::Ready(Ok(()))
     }
 
-    /// Get the value of read_buffer.
-    pub fn read_buffer(&self) -> Arc<Mutex<BytesMut>> {
-        self.read_buffer.clone()
-    }
-
-    /// Sets the state of the [DataChannel].
-    pub(crate) fn set_state(&mut self, state: RtcDataChannelState) {
-        self.state = state;
-    }
     /// Whether the data channel is ready for reading or writing.
     fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        match self.state_mut() {
-            RtcDataChannelState::InboundOpening | RtcDataChannelState::OutboundOpening => {
-                // open_waker register(cx.waker());
-                // We need to signal to the connection that we are waiting for the channel to open.
+        // Poll for state changes
+        futures::ready!(self.poll_state_changes(cx))?;
+
+        match self.state {
+            RtcDataChannelState::Created => {
+                // First time this function is called,
+                // we need to register the waker and
+                // set state to Opening
+                self.state = RtcDataChannelState::Opening;
+
                 self.wakers.open.register(cx.waker());
                 Poll::Pending
             }
+            RtcDataChannelState::Opening => {
+                // Second time this function is called,
+                // was called by the waker, so we can set state to Open
+                // and return Ok(())
+                self.state = RtcDataChannelState::Open;
+                Poll::Ready(Ok(()))
+            }
+            RtcDataChannelState::Open => Poll::Ready(Ok(())),
             RtcDataChannelState::Closing | RtcDataChannelState::Closed => {
                 Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
             }
-            RtcDataChannelState::Open => Poll::Ready(Ok(())),
         }
     }
 }
@@ -170,7 +152,7 @@ impl AsyncRead for PollDataChannel {
         // Send request (with embedded reply handle) to the Connection to get any new data.
         let (tx, mut rx) = futures::channel::oneshot::channel();
         let read_ready = ReadReady {
-            channel_id: this.channel_id,
+            // channel_id: this.channel_id,
             response: tx,
         };
 
@@ -260,11 +242,11 @@ impl AsyncWrite for PollDataChannel {
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
-        if this.state() == RtcDataChannelState::Closed {
+        if this.state == RtcDataChannelState::Closed {
             return Poll::Ready(Ok(()));
         }
 
-        if this.state() == RtcDataChannelState::Closing {
+        if this.state == RtcDataChannelState::Closing {
             let mut rtc = this.rtc.lock().unwrap();
             rtc.direct_api().close_data_channel(this.channel_id);
         }

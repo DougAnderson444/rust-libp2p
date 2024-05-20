@@ -2,27 +2,16 @@
 //! Each Channel has an Id and a State.
 
 use futures::task::AtomicWaker;
-use std::sync::Arc;
-use std::task::Context;
+use std::sync::{Arc, Mutex};
 
-/// Enum of the various types of Wakers:
-/// - new data
-/// - open
-/// - write
-/// - close
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub(crate) enum WakerType {
-    /// Waker for when we have new data.
-    NewData,
-
-    /// Waker for when we are waiting for the DC to be opened.
-    Open,
-
-    /// Waker for when we are waiting for the DC to be closed.
-    Close,
-
-    /// Waker for when we are waiting for the DC to be written to.
-    Write,
+#[derive(Debug)]
+pub(crate) struct ChannelDetails {
+    /// The wakers for this channel_id
+    pub(crate) wakers: ChannelWakers,
+    /// [ReadReady] channel data receiver.
+    pub(crate) channel_data_rx: Mutex<futures::channel::mpsc::Receiver<ReadReady>>,
+    /// [StateChange] channel data receiver.
+    pub(crate) channel_state_rx: Mutex<futures::channel::mpsc::Receiver<StateChange>>,
 }
 
 /// Wakers for the different types of wakers
@@ -38,40 +27,38 @@ pub(crate) struct ChannelWakers {
     pub(crate) write: Arc<AtomicWaker>,
 }
 
-/// Waker Struct for the different types of wakers
-#[derive(Debug, Clone, Default)]
-pub(crate) struct Waker {
-    /// Waker
-    waker: Arc<AtomicWaker>,
+/// Encapsulates State changes for the DataChannel sent form the Connection.
+#[derive(Debug)]
+pub(crate) struct StateChange {
+    /// The new state of the DataChannel.
+    pub(crate) response: futures::channel::oneshot::Sender<RtcDataChannelState>,
 }
 
-impl Waker {
-    /// Create a new Waker.
-    pub(crate) fn new(waker: Arc<AtomicWaker>) -> Self {
-        Self { waker }
-    }
-
-    /// Register the Waker to the given Context.
-    pub(crate) fn register(&self, cx: &mut Context) {
-        self.waker.register(cx.waker());
-    }
+/// Simple struct to indicate that the channel is ready to read. Has a reply oneshot channel
+/// embedded so that [crate::tokio::Connection] can send the read_buffer back to the [PollDataChannel].
+#[derive(Debug)]
+pub(crate) struct ReadReady {
+    // /// The channel id of the channel that is ready to read.
+    // pub(crate) channel_id: ChannelId,
+    /// The reply channel to send the read_buffer back to the [PollDataChannel].
+    pub(crate) response: futures::channel::oneshot::Sender<Vec<u8>>,
 }
 
 /// Channel state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum RtcDataChannelState {
-    /// Channel is closed.
-    Closed,
+pub(crate) enum RtcDataChannelState {
+    /// First State, newly created
+    Created,
+
+    /// Second state, Channel is opening.
+    Opening,
+
+    /// Third state, Channel is open.
+    Open,
 
     /// Channel is closing.
     Closing,
 
-    /// Inbound channel is opening.
-    InboundOpening,
-
-    /// Outbound channel is opening.
-    OutboundOpening,
-
-    /// Channel is open.
-    Open,
+    /// Channel is closed.
+    Closed,
 }
