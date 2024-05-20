@@ -1,4 +1,4 @@
-use futures::{AsyncRead, AsyncWrite, FutureExt, StreamExt};
+use futures::{AsyncRead, AsyncWrite, FutureExt};
 use libp2p_webrtc_utils::MAX_MSG_LEN;
 use std::cmp::min;
 use std::io;
@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use str0m::channel::{ChannelData, ChannelId};
+use str0m::channel::ChannelId;
 use str0m::Rtc;
 use tokio_util::bytes::BytesMut;
 
