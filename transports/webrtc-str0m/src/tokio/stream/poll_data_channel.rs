@@ -10,7 +10,7 @@ use str0m::channel::ChannelId;
 use str0m::Rtc;
 use tokio_util::bytes::BytesMut;
 
-use crate::tokio::channel::{ChannelWakers, ReadReady, RtcDataChannelState, StateChange};
+use crate::tokio::channel::{ChannelWakers, ReadReady, RtcDataChannelState, StateInquiry};
 use crate::tokio::Error;
 
 /// [`PollDataChannel`] is a wrapper around around [`Rtc`], [`ChannelId`], and [`Connection`] which are needed to read and write, and thenit also implements [`AsyncRead`] and [`AsyncWrite`] to satify libp2p.
@@ -46,7 +46,7 @@ pub(crate) struct PollDataChannel {
     read_ready_signal: futures::channel::mpsc::Sender<ReadReady>,
 
     /// State change signal.
-    channel_state_signal: futures::channel::mpsc::Sender<StateChange>,
+    channel_state_signal: futures::channel::mpsc::Sender<StateInquiry>,
 }
 
 impl PollDataChannel {
@@ -57,7 +57,7 @@ impl PollDataChannel {
         rtc: Arc<Mutex<Rtc>>,
         send_wakers: futures::channel::mpsc::Sender<ChannelWakers>,
         read_ready_signal: futures::channel::mpsc::Sender<ReadReady>,
-        channel_state_signal: futures::channel::mpsc::Sender<StateChange>,
+        channel_state_signal: futures::channel::mpsc::Sender<StateInquiry>,
     ) -> Result<Self, Error> {
         // We purposely don't use `with_capacity` so we don't eagerly allocate `MAX_READ_BUFFER` per stream.
         let read_buffer = Arc::new(Mutex::new(BytesMut::new()));
@@ -89,7 +89,10 @@ impl PollDataChannel {
         // Send request (with embedded reply handle) to the Connection to get the state.
         let (tx, mut rx) = futures::channel::oneshot::channel();
 
-        let state_change = StateChange { response: tx };
+        let state_change = StateInquiry {
+            response: tx,
+            channel_id: self.channel_id,
+        };
 
         // Send it!
         if let Err(e) = self.channel_state_signal.try_send(state_change) {
@@ -101,17 +104,26 @@ impl PollDataChannel {
         }
 
         // listen on rx for the data from Connection response
-        let new_state = futures::ready!(rx.poll_unpin(cx)).unwrap();
-
-        self.state = new_state;
-
-        Poll::Ready(Ok(()))
+        match rx.poll_unpin(cx) {
+            Poll::Ready(Ok(state)) => {
+                self.state = state;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => {
+                tracing::error!("Failed to get state from Connection: {:?}", e);
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Failed to get state from Connection",
+                )))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     /// Whether the data channel is ready for reading or writing.
     fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         // Poll for state changes
-        futures::ready!(self.poll_state_changes(cx))?;
+        let _ = self.poll_state_changes(cx);
 
         match self.state {
             RtcDataChannelState::Created => {
@@ -120,7 +132,7 @@ impl PollDataChannel {
                 // set state to Opening
                 self.state = RtcDataChannelState::Opening;
 
-                self.wakers.open.register(cx.waker());
+                // self.wakers.open.register(cx.waker());
                 Poll::Pending
             }
             RtcDataChannelState::Opening => {
@@ -252,7 +264,7 @@ impl AsyncWrite for PollDataChannel {
         }
 
         // Register WakerType::Close with cx.waker()
-        this.wakers.close.register(cx.waker());
+        // this.wakers.close.register(cx.waker());
 
         Poll::Pending
     }

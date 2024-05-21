@@ -12,12 +12,11 @@ mod opening;
 
 pub(crate) use self::open::{Open, OpenConfig};
 pub(crate) use self::opening::Opening;
-use crate::tokio::channel::ReadReady;
 use crate::tokio::fingerprint::Fingerprint;
 use crate::tokio::UdpSocket;
 
 use futures::stream::FuturesUnordered;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
 use libp2p_identity::PeerId;
 use std::cell::RefCell;
@@ -39,7 +38,9 @@ use tokio::sync::mpsc::{self, Receiver};
 
 use crate::tokio::Error;
 
-use super::channel::{ChannelDetails, ChannelWakers, RtcDataChannelState};
+use super::channel::{
+    ChannelDetails, ChannelWakers, RtcDataChannelState, StateInquiry, StateUpdate,
+};
 use super::stream::{DropListener, Stream};
 
 /// The size of the buffer for incoming datagrams.
@@ -161,7 +162,7 @@ pub struct Connection<Stage = Opening> {
     socket: Arc<UdpSocket>,
 
     /// Channel details by channel_id, such as wakers, data receivers, and state change receivers.
-    channel_details: HashMap<ChannelId, RefCell<ChannelDetails>>,
+    channel_details: HashMap<ChannelId, Mutex<ChannelDetails>>,
 
     /// Rtc object associated with the connection.
     rtc: Arc<Mutex<Rtc>>,
@@ -189,6 +190,17 @@ pub struct Connection<Stage = Opening> {
 
     /// Is set when there are no drop listeners,
     no_drop_listeners_waker: Option<Waker>,
+
+    /// Channel for state inquiries for [ChannelId]. We need an inquiry [Sender] for
+    /// each channel, as each channel has a unique state.
+    ///
+    /// When a [PollDataChannel] is created, it will be passed a clone of this [Sender]
+    /// `state_inquiry_channel.0.clone()` and will use it to send inquiries about the state of the channel.
+    tx_state_inquiry: Option<mpsc::Sender<StateInquiry>>,
+
+    /// Receiver for state updates from a [PollDataChannel]. We only need one of these
+    /// as this single Connection will be the only one sending updates.
+    tx_state_update: Option<mpsc::Sender<StateUpdate>>,
 }
 
 impl<Stage> Unpin for Connection<Stage> {}
@@ -269,15 +281,35 @@ impl<Stage: Connectable> Connection<Stage> {
                             "channel opened",
                         );
 
-                        let channel_details = self.channel_details.get(&channel_id).expect(
-                            "ChannelDetails should be present in the Connection struct for the channel_id",
-                        ).try_borrow_mut().expect("ChannelDetails should be mutable");
+                        let channel_details = ChannelDetails {
+                            state: RtcDataChannelState::Opening,
+                            wakers: ChannelWakers::default(),
+                            channel_data_rx: Mutex::new(futures::channel::mpsc::channel(1).1),
+                            channel_state_rx: Mutex::new(futures::channel::mpsc::channel(1).1),
+                        };
 
-                        // Use the waker to notify the PollDataChannel that the channel is open
-                        // (ready to read and write data)
-                        // This needs to be a waker, as the PollDataChannel can't have
-                        // Receiver<> in it's state (must be :Clone).
-                        channel_details.wakers.open.wake();
+                        // set the channel state to Open RtcDataChannelState::Open;
+                        match self.tx_state_update.as_ref() {
+                            Some(tx) => {
+                                let message = StateUpdate {
+                                    channel_id,
+                                    state: RtcDataChannelState::Open,
+                                };
+                                tx.try_send(message).unwrap();
+                            }
+                            None => {
+                                tracing::error!(
+                                    "No state update channel for channel_id: {:?}",
+                                    channel_id
+                                );
+                            }
+                        }
+
+                        while let Ok(Some(reply)) =
+                            channel_details.channel_state_rx.lock().unwrap().try_next()
+                        {
+                            reply.response.send(RtcDataChannelState::Open).unwrap();
+                        }
 
                         // Call any Stage specific handler for Channel Open event
                         self.stage.on_event_channel_open(channel_id, name)
@@ -288,7 +320,7 @@ impl<Stage: Connectable> Connection<Stage> {
 
                         let channel_details = self.channel_details.get(&data.id).expect(
                             "ChannelDetails should be present in the Connection struct for the channel_id",
-                        ).try_borrow_mut().expect("ChannelDetails should be mutable");
+                        ).lock().unwrap();
 
                         channel_details.wakers.new_data.wake();
 
@@ -311,12 +343,27 @@ impl<Stage: Connectable> Connection<Stage> {
                         let channel_details = self.channel_details.get(&channel_id).expect(
                             "ChannelDetails should be present in the Connection struct for the channel_id",
                         );
-                        {
-                            let channel_details = channel_details.borrow_mut();
-                            // Set the channel state to Closed
-                            channel_details.wakers.close.wake();
+
+                        // State Change to Closed
+                        match self.tx_state_update.as_ref() {
+                            Some(tx) => {
+                                let message = StateUpdate {
+                                    channel_id,
+                                    state: RtcDataChannelState::Closed,
+                                };
+                                tx.try_send(message).unwrap();
+                            }
+                            None => {
+                                tracing::error!(
+                                    "No state update channel for channel_id: {:?}",
+                                    channel_id
+                                );
+                            }
                         }
-                        self.channel_details.remove(&channel_id);
+
+                        // if we do this here, PollDataChannel will not be able to
+                        // get the channel state
+                        // self.channel_details.remove(&channel_id);
 
                         // Deal with the Stage specific handler for Channel Closed event
                         self.stage.on_event_channel_close(channel_id)
@@ -332,10 +379,86 @@ impl<Stage: Connectable> Connection<Stage> {
     }
 }
 
+// TODO: Connectable trait?
 impl<Stage> Connection<Stage> {
+    /// Creates a new `Connection` in the Opening state.
+    pub fn new(
+        rtc: Arc<Mutex<Rtc>>,
+        socket: Arc<UdpSocket>,
+        source: SocketAddr,
+        // as long as stage impl Connectable, we can use it here
+        stage: Stage,
+    ) -> Self {
+        // Create a channel for sending datagrams to the connection event handler.
+        let (relay_dgram, dgram_rx) = mpsc::channel(DATAGRAM_BUFFER_SIZE);
+        let (tx_ondatachannel, rx_ondatachannel) = futures::channel::mpsc::channel(1);
+
+        let local_address = socket.local_addr().unwrap();
+
+        Self {
+            rtc,
+            socket,
+            stage,
+            relay_dgram,
+            dgram_rx,
+            peer_address: PeerAddress(source),
+            local_address,
+            tx_ondatachannel,
+            rx_ondatachannel,
+            drop_listeners: Default::default(),
+            no_drop_listeners_waker: Default::default(),
+            channel_details: Default::default(),
+            tx_state_inquiry: None,
+            tx_state_update: None,
+        }
+    }
+
     /// Getter for Rtc
     pub fn rtc(&self) -> Arc<Mutex<Rtc>> {
         Arc::clone(&self.rtc)
+    }
+
+    /// Spawns a tokio task which listens on the given mpsc receiver for incoming
+    /// inquiries about self.state of a channel_id, and responds with the current state.
+    pub fn state_loop(&mut self) {
+        // Make the state_inquiry channel
+        let (tx_state_inquiry, mut rx_state_inquiry) = mpsc::channel::<StateInquiry>(4);
+
+        let (tx_state_update, mut rx_state_update) = mpsc::channel::<StateUpdate>(1);
+
+        self.tx_state_inquiry = Some(tx_state_inquiry);
+        self.tx_state_update = Some(tx_state_update);
+
+        tokio::spawn(async move {
+            let mut channel_details: HashMap<ChannelId, RefCell<ChannelDetails>> = HashMap::new();
+            // lopp on tokio select on receiving state inquiries and updates
+            loop {
+                tokio::select! {
+                    Some(update) = rx_state_update.recv() => {
+                        // Update the state of the channel
+                        let mut channel_details = channel_details.get(&update.channel_id).expect("ChannelDetails should be present in the Connection struct for the channel_id").borrow_mut();
+                        channel_details.state = update.state;
+                    }
+                    Some(inquiry) = rx_state_inquiry.recv() => {
+                        // Respond with the current state of the channel
+                        let deets = channel_details.get(&inquiry.channel_id).expect("ChannelDetails should be present in the Connection struct for the channel_id").borrow();
+                        match inquiry.response.send(deets.state.clone()) {
+                            Ok(_) => {
+                                if let RtcDataChannelState::Closed = deets.state {
+                                    drop(deets);
+                                    // Remove the channel from the channel_details
+                                    channel_details.remove(&inquiry.channel_id);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to send channel state response: {:?}", e);
+                            }
+                        }
+
+                    }
+                }
+            }
+        });
     }
 
     /// New Stream from Data Channel ID
@@ -347,12 +470,12 @@ impl<Stage> Connection<Stage> {
             Stream::new(channel_id, RtcDataChannelState::Open, self.rtc.clone())
                 .map_err(|_| Error::StreamCreationFailed)?;
 
-        let mut channel_details = self
-            .channel_details
-            .get(&channel_id)
-            .expect("ChannelDetails should be present in the Connection struct for the channel_id")
-            .try_borrow_mut()
-            .expect("Channel details should be mutable");
+        let mut channel_details = ChannelDetails {
+            state: RtcDataChannelState::Opening,
+            wakers: ChannelWakers::default(),
+            channel_data_rx: reply_rx,
+            channel_state_rx,
+        };
 
         match waker_rx.try_next() {
             Ok(Some(wakers)) => {
@@ -367,6 +490,9 @@ impl<Stage> Connection<Stage> {
             }
         }
 
+        self.channel_details
+            .insert(channel_id, Mutex::new(channel_details));
+
         // The Stream also gives us the mpsc::Receiver<ReadReady>
         // to send data to the PollDataChannel, we need to store this
         // in self so we can rx.try_next() to know when to reply
@@ -376,9 +502,6 @@ impl<Stage> Connection<Stage> {
         // Track the drop listener
         // TODO: Verify that noise channels are dropped correctly from this list
         self.drop_listeners.push(drop_listener);
-
-        // Save the channel state changes to ChannelDetails
-        channel_details.channel_state_rx = channel_state_rx;
 
         // Wake .poll()
         if let Some(waker) = self.no_drop_listeners_waker.take() {

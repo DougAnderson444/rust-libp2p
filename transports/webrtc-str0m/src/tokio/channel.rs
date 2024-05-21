@@ -3,6 +3,7 @@
 
 use futures::task::AtomicWaker;
 use std::sync::{Arc, Mutex};
+use str0m::channel::ChannelId;
 
 #[derive(Debug)]
 pub(crate) struct ChannelDetails {
@@ -11,7 +12,9 @@ pub(crate) struct ChannelDetails {
     /// [ReadReady] channel data receiver.
     pub(crate) channel_data_rx: Mutex<futures::channel::mpsc::Receiver<ReadReady>>,
     /// [StateChange] channel data receiver.
-    pub(crate) channel_state_rx: Mutex<futures::channel::mpsc::Receiver<StateChange>>,
+    pub(crate) channel_state_rx: Mutex<futures::channel::mpsc::Receiver<StateInquiry>>,
+    /// The current state of this channel id
+    pub(crate) state: RtcDataChannelState,
 }
 
 /// Wakers for the different types of wakers
@@ -19,19 +22,26 @@ pub(crate) struct ChannelDetails {
 pub(crate) struct ChannelWakers {
     /// Waker for when we have new data.
     pub(crate) new_data: Arc<AtomicWaker>,
-    /// Waker for when we are waiting for the DC to be opened.
-    pub(crate) open: Arc<AtomicWaker>,
-    /// Waker for when we are waiting for the DC to be closed.
-    pub(crate) close: Arc<AtomicWaker>,
     /// Waker for when we are waiting for the DC to be written to.
     pub(crate) write: Arc<AtomicWaker>,
 }
 
 /// Encapsulates State changes for the DataChannel sent form the Connection.
 #[derive(Debug)]
-pub(crate) struct StateChange {
+pub(crate) struct StateInquiry {
+    /// The channel id we want to know about
+    pub(crate) channel_id: ChannelId,
     /// The new state of the DataChannel.
     pub(crate) response: futures::channel::oneshot::Sender<RtcDataChannelState>,
+}
+
+/// State Update, includes the channel id and the new state.
+#[derive(Debug)]
+pub(crate) struct StateUpdate {
+    /// The channel id we want to know about
+    pub(crate) channel_id: ChannelId,
+    /// The new state of the DataChannel.
+    pub(crate) state: RtcDataChannelState,
 }
 
 /// Simple struct to indicate that the channel is ready to read. Has a reply oneshot channel
