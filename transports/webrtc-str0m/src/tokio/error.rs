@@ -67,4 +67,15 @@ pub enum Error {
 
     #[error("Noise handshake failed")]
     NoiseHandshakeFailed,
+
+    /// From oneshot::canceled
+    #[error("oneshot canceled")]
+    OneshotCanceled(#[from] futures::channel::oneshot::Canceled),
+}
+
+impl Error {
+    /// Create a new `Error` from an `io::ErrorKind` and a string
+    pub fn new(kind: ErrorKind, msg: &str) -> Self {
+        Error::Io(io::Error::new(kind, msg))
+    }
 }

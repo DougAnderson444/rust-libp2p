@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use str0m::channel::ChannelId;
 use str0m::Rtc;
+use tokio::sync::mpsc;
 use tokio_util::bytes::BytesMut;
 
 use crate::tokio::channel::{ChannelWakers, ReadReady, RtcDataChannelState, StateInquiry};
@@ -23,7 +24,7 @@ pub(crate) struct PollDataChannel {
     /// str0m Rtc instance for writing
     rtc: Arc<Mutex<Rtc>>,
 
-    /// Channel state.
+    /// Local state
     state: RtcDataChannelState,
 
     /// Wakers for this [DataChannel].
@@ -46,7 +47,7 @@ pub(crate) struct PollDataChannel {
     read_ready_signal: futures::channel::mpsc::Sender<ReadReady>,
 
     /// State change signal.
-    channel_state_signal: futures::channel::mpsc::Sender<StateInquiry>,
+    tx_state_inquiry: mpsc::Sender<StateInquiry>,
 }
 
 impl PollDataChannel {
@@ -57,7 +58,7 @@ impl PollDataChannel {
         rtc: Arc<Mutex<Rtc>>,
         send_wakers: futures::channel::mpsc::Sender<ChannelWakers>,
         read_ready_signal: futures::channel::mpsc::Sender<ReadReady>,
-        channel_state_signal: futures::channel::mpsc::Sender<StateInquiry>,
+        tx_state_inquiry: mpsc::Sender<StateInquiry>,
     ) -> Result<Self, Error> {
         // We purposely don't use `with_capacity` so we don't eagerly allocate `MAX_READ_BUFFER` per stream.
         let read_buffer = Arc::new(Mutex::new(BytesMut::new()));
@@ -72,21 +73,17 @@ impl PollDataChannel {
         Ok(Self {
             channel_id,
             rtc,
-            state: RtcDataChannelState::Opening,
             wakers,
             read_buffer,
             overloaded,
             read_ready_signal,
-            channel_state_signal,
+            tx_state_inquiry,
+            state: RtcDataChannelState::Opening,
         })
     }
 
-    /// Polls for state changes sent from the Connection.
-    /// Reading state is much like reading data,
-    /// Once woken, it sends a signal to the Connection to get the state
-    /// Once the state response is received, it sets the state to the new state.
-    fn poll_state_changes(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        // Send request (with embedded reply handle) to the Connection to get the state.
+    /// Polls the state of the data channel.
+    fn poll_state(&mut self, cx: &mut Context) -> Poll<Result<RtcDataChannelState, Error>> {
         let (tx, mut rx) = futures::channel::oneshot::channel();
 
         let state_change = StateInquiry {
@@ -94,20 +91,35 @@ impl PollDataChannel {
             channel_id: self.channel_id,
         };
 
-        // Send it!
-        if let Err(e) = self.channel_state_signal.try_send(state_change) {
+        if let Err(e) = self.tx_state_inquiry.try_send(state_change) {
             tracing::error!("Failed to send state_change signal: {:?}", e);
-            return Poll::Ready(Err(io::Error::new(
+            return Poll::Ready(Err(Error::new(
                 io::ErrorKind::Other,
-                "Failed to send state_change signal",
+                "Failed to send state_inquiry signal",
             )));
         }
 
-        // listen on rx for the data from Connection response
-        match rx.poll_unpin(cx) {
-            Poll::Ready(Ok(state)) => {
-                self.state = state;
+        rx.poll_unpin(cx).map_err(Error::OneshotCanceled)
+    }
+
+    /// Whether the data channel is ready for reading or writing (Open).
+    fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        match self.poll_state(cx) {
+            Poll::Ready(Ok(RtcDataChannelState::Opening)) => {
+                self.state = RtcDataChannelState::Opening;
+                self.wakers.open.register(cx.waker());
+                Poll::Pending
+            }
+            Poll::Ready(Ok(RtcDataChannelState::Open)) => {
+                self.state = RtcDataChannelState::Open;
                 Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(RtcDataChannelState::Closed)) => {
+                self.state = RtcDataChannelState::Closed;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "DataChannel is closed",
+                )))
             }
             Poll::Ready(Err(e)) => {
                 tracing::error!("Failed to get state from Connection: {:?}", e);
@@ -117,35 +129,6 @@ impl PollDataChannel {
                 )))
             }
             Poll::Pending => Poll::Pending,
-        }
-    }
-
-    /// Whether the data channel is ready for reading or writing.
-    fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        // Poll for state changes
-        let _ = self.poll_state_changes(cx);
-
-        match self.state {
-            RtcDataChannelState::Created => {
-                // First time this function is called,
-                // we need to register the waker and
-                // set state to Opening
-                self.state = RtcDataChannelState::Opening;
-
-                // self.wakers.open.register(cx.waker());
-                Poll::Pending
-            }
-            RtcDataChannelState::Opening => {
-                // Second time this function is called,
-                // was called by the waker, so we can set state to Open
-                // and return Ok(())
-                self.state = RtcDataChannelState::Open;
-                Poll::Ready(Ok(()))
-            }
-            RtcDataChannelState::Open => Poll::Ready(Ok(())),
-            RtcDataChannelState::Closing | RtcDataChannelState::Closed => {
-                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
-            }
         }
     }
 }
@@ -251,20 +234,15 @@ impl AsyncWrite for PollDataChannel {
         Poll::Ready(Ok(()))
     }
 
+    /// Attempt to close the object.
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-
-        if this.state == RtcDataChannelState::Closed {
+        if self.state == RtcDataChannelState::Closed {
             return Poll::Ready(Ok(()));
         }
 
-        if this.state == RtcDataChannelState::Closing {
-            let mut rtc = this.rtc.lock().unwrap();
-            rtc.direct_api().close_data_channel(this.channel_id);
-        }
-
-        // Register WakerType::Close with cx.waker()
-        // this.wakers.close.register(cx.waker());
+        let mut rtc = self.rtc.lock().unwrap();
+        rtc.direct_api().close_data_channel(self.channel_id);
+        self.wakers.close.register(cx.waker());
 
         Poll::Pending
     }

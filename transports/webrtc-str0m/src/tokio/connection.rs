@@ -285,7 +285,6 @@ impl<Stage: Connectable> Connection<Stage> {
                             state: RtcDataChannelState::Opening,
                             wakers: ChannelWakers::default(),
                             channel_data_rx: Mutex::new(futures::channel::mpsc::channel(1).1),
-                            channel_state_rx: Mutex::new(futures::channel::mpsc::channel(1).1),
                         };
 
                         // set the channel state to Open RtcDataChannelState::Open;
@@ -303,12 +302,6 @@ impl<Stage: Connectable> Connection<Stage> {
                                     channel_id
                                 );
                             }
-                        }
-
-                        while let Ok(Some(reply)) =
-                            channel_details.channel_state_rx.lock().unwrap().try_next()
-                        {
-                            reply.response.send(RtcDataChannelState::Open).unwrap();
                         }
 
                         // Call any Stage specific handler for Channel Open event
@@ -440,21 +433,29 @@ impl<Stage> Connection<Stage> {
                         channel_details.state = update.state;
                     }
                     Some(inquiry) = rx_state_inquiry.recv() => {
-                        // Respond with the current state of the channel
-                        let deets = channel_details.get(&inquiry.channel_id).expect("ChannelDetails should be present in the Connection struct for the channel_id").borrow();
-                        match inquiry.response.send(deets.state.clone()) {
-                            Ok(_) => {
-                                if let RtcDataChannelState::Closed = deets.state {
-                                    drop(deets);
-                                    // Remove the channel from the channel_details
-                                    channel_details.remove(&inquiry.channel_id);
+                        // Respond with the current state of the channel, if it exists
+                        match channel_details.get(&inquiry.channel_id) {
+                            Some(deets) => {
+                                let deets = deets.borrow();
+                                match inquiry.response.send(deets.state.clone()) {
+                                    Ok(_) => {
+                                        if let RtcDataChannelState::Closed = deets.state {
+                                            drop(deets);
+                                            // Remove the channel from the channel_details
+                                            channel_details.remove(&inquiry.channel_id);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to send channel state response: {:?}", e);
+                                    }
                                 }
                             }
-                            Err(e) => {
-                                tracing::error!("Failed to send channel state response: {:?}", e);
+                            None => {
+                                tracing::warn!("No channel details for channel_id: {:?}", inquiry.channel_id);
+                                // send opening state
+                                inquiry.response.send(RtcDataChannelState::Opening).unwrap();
                             }
                         }
-
                     }
                 }
             }
@@ -466,15 +467,25 @@ impl<Stage> Connection<Stage> {
         &mut self,
         channel_id: ChannelId,
     ) -> Result<Stream, Error> {
-        let (stream, drop_listener, mut waker_rx, reply_rx, channel_state_rx) =
-            Stream::new(channel_id, RtcDataChannelState::Open, self.rtc.clone())
-                .map_err(|_| Error::StreamCreationFailed)?;
+        // if self.tx_state_inquiry.is_none() throw an error "Did you start the state loop?"
+        let Some(tx_state_inquiry) = self.tx_state_inquiry.as_ref() else {
+            return Err(Error::Internal(
+                "No State Sender. Did you start the state loop?".to_string(),
+            ));
+        };
+
+        let (stream, drop_listener, mut waker_rx, reply_rx) = Stream::new(
+            channel_id,
+            RtcDataChannelState::Open,
+            self.rtc.clone(),
+            tx_state_inquiry.clone(),
+        )
+        .map_err(|_| Error::StreamCreationFailed)?;
 
         let mut channel_details = ChannelDetails {
             state: RtcDataChannelState::Opening,
             wakers: ChannelWakers::default(),
             channel_data_rx: reply_rx,
-            channel_state_rx,
         };
 
         match waker_rx.try_next() {

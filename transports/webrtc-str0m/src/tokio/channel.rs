@@ -11,8 +11,6 @@ pub(crate) struct ChannelDetails {
     pub(crate) wakers: ChannelWakers,
     /// [ReadReady] channel data receiver.
     pub(crate) channel_data_rx: Mutex<futures::channel::mpsc::Receiver<ReadReady>>,
-    /// [StateChange] channel data receiver.
-    pub(crate) channel_state_rx: Mutex<futures::channel::mpsc::Receiver<StateInquiry>>,
     /// The current state of this channel id
     pub(crate) state: RtcDataChannelState,
 }
@@ -22,8 +20,12 @@ pub(crate) struct ChannelDetails {
 pub(crate) struct ChannelWakers {
     /// Waker for when we have new data.
     pub(crate) new_data: Arc<AtomicWaker>,
+    /// New state of the DataChannel.
+    pub(crate) open: Arc<AtomicWaker>,
     /// Waker for when we are waiting for the DC to be written to.
     pub(crate) write: Arc<AtomicWaker>,
+    /// CLose waker, wakes when state is Closed.
+    pub(crate) close: Arc<AtomicWaker>,
 }
 
 /// Encapsulates State changes for the DataChannel sent form the Connection.
@@ -57,17 +59,11 @@ pub(crate) struct ReadReady {
 /// Channel state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum RtcDataChannelState {
-    /// First State, newly created
-    Created,
-
     /// Second state, Channel is opening.
     Opening,
 
     /// Third state, Channel is open.
     Open,
-
-    /// Channel is closing.
-    Closing,
 
     /// Channel is closed.
     Closed,
