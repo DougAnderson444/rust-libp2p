@@ -9,6 +9,12 @@ pub struct Opening {
     handshake_state: HandshakeState,
 }
 
+impl Default for Opening {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Opening {
     /// Creates a new `Opening` state.
     pub fn new() -> Self {
@@ -25,6 +31,39 @@ impl Opening {
 
 /// Implementations that apply only to the Opening Connection state.
 impl Connection<Opening> {
+    /// Creates a new `Connection` in the Opening state.
+    pub fn new(rtc: Arc<Mutex<Rtc>>, socket: Arc<UdpSocket>, source: SocketAddr) -> Self {
+        // Create a channel for sending datagrams to the connection event handler.
+        let (relay_dgram, dgram_rx) = mpsc::channel(DATAGRAM_BUFFER_SIZE);
+        let (tx_ondatachannel, rx_ondatachannel) = futures::channel::mpsc::channel(1);
+
+        let local_address = socket.local_addr().unwrap();
+
+        // Make the state_inquiry channel
+        let (tx_state_inquiry, rx_state_inquiry) = mpsc::channel::<StateInquiry>(4);
+
+        let (tx_state_update, rx_state_update) = mpsc::channel::<StateUpdate>(1);
+
+        state_loop(rx_state_update, rx_state_inquiry);
+
+        Self {
+            rtc,
+            socket,
+            stage: Opening::new(),
+            relay_dgram,
+            dgram_rx,
+            peer_address: PeerAddress(source),
+            local_address,
+            tx_ondatachannel,
+            rx_ondatachannel,
+            drop_listeners: Default::default(),
+            no_drop_listeners_waker: Default::default(),
+            channel_details: Default::default(),
+            tx_state_inquiry,
+            tx_state_update,
+        }
+    }
+
     /// Completes the connection opening process.
     /// The only way to get to Open is to go throguh Opening.
     /// Openin> to Open moves values into the Open state.

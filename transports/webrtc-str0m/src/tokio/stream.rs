@@ -32,7 +32,6 @@ pub(crate) type DropListener = libp2p_webrtc_utils::DropListener<PollDataChannel
 impl Stream {
     pub(crate) fn new(
         channel_id: ChannelId,
-        state: RtcDataChannelState,
         rtc: Arc<Mutex<Rtc>>,
         tx_state_inquiry: mpsc::Sender<StateInquiry>,
     ) -> Result<

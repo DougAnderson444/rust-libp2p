@@ -46,11 +46,10 @@ pub(crate) async fn inbound(
     let (rtc, noise_channel_id) =
         make_rtc_client(&remote_ufrag, &remote_ufrag, source, destination, dtls_cert);
 
-    let connection: Arc<Mutex<Connection<Opening>>> = Arc::new(Mutex::new(Connection::new(
+    let connection = Arc::new(Mutex::new(Connection::new(
         rtc.clone(),
         udp_manager.lock().unwrap().socket(),
         source,
-        Opening::new(),
     )));
 
     let noise_stream = connection

@@ -20,6 +20,7 @@ use futures::{FutureExt, StreamExt};
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
 use libp2p_identity::PeerId;
 use std::cell::RefCell;
+use std::sync::MutexGuard;
 use std::task::{ready, Context, Poll, Waker};
 use std::{
     collections::HashMap,
@@ -281,12 +282,6 @@ impl<Stage: Connectable> Connection<Stage> {
                             "channel opened",
                         );
 
-                        let channel_details = ChannelDetails {
-                            state: RtcDataChannelState::Opening,
-                            wakers: ChannelWakers::default(),
-                            channel_data_rx: Mutex::new(futures::channel::mpsc::channel(1).1),
-                        };
-
                         // set the channel state to Open RtcDataChannelState::Open;
                         let message = StateUpdate {
                             channel_id,
@@ -298,6 +293,11 @@ impl<Stage: Connectable> Connection<Stage> {
                                 "No state update channel for channel_id: {:?}",
                                 channel_id
                             );
+                        }
+
+                        // shake open waker to prompt PollDataChannel to re-poll
+                        if let Some(ch) = self.channel(channel_id) {
+                            ch.wakers.open.wake()
                         }
 
                         // Call any Stage specific handler for Channel Open event
@@ -365,48 +365,22 @@ impl<Stage: Connectable> Connection<Stage> {
 
 // TODO: Connectable trait?
 impl<Stage> Connection<Stage> {
-    /// Creates a new `Connection` in the Opening state.
-    pub fn new(
-        rtc: Arc<Mutex<Rtc>>,
-        socket: Arc<UdpSocket>,
-        source: SocketAddr,
-        // as long as stage impl Connectable, we can use it here
-        stage: Stage,
-    ) -> Self {
-        // Create a channel for sending datagrams to the connection event handler.
-        let (relay_dgram, dgram_rx) = mpsc::channel(DATAGRAM_BUFFER_SIZE);
-        let (tx_ondatachannel, rx_ondatachannel) = futures::channel::mpsc::channel(1);
-
-        let local_address = socket.local_addr().unwrap();
-
-        // Make the state_inquiry channel
-        let (tx_state_inquiry, rx_state_inquiry) = mpsc::channel::<StateInquiry>(4);
-
-        let (tx_state_update, rx_state_update) = mpsc::channel::<StateUpdate>(1);
-
-        state_loop(rx_state_update, rx_state_inquiry);
-
-        Self {
-            rtc,
-            socket,
-            stage,
-            relay_dgram,
-            dgram_rx,
-            peer_address: PeerAddress(source),
-            local_address,
-            tx_ondatachannel,
-            rx_ondatachannel,
-            drop_listeners: Default::default(),
-            no_drop_listeners_waker: Default::default(),
-            channel_details: Default::default(),
-            tx_state_inquiry,
-            tx_state_update,
-        }
-    }
-
     /// Getter for Rtc
     pub fn rtc(&self) -> Arc<Mutex<Rtc>> {
         Arc::clone(&self.rtc)
+    }
+
+    /// Get the channel details for a channel_id.
+    ///
+    /// Convenience method for:
+    /// ```
+    ///self.channel_details
+    /// .get(&channel_id)?
+    /// .lock()
+    /// .unwrap()
+    /// ```
+    pub(crate) fn channel(&self, id: ChannelId) -> Option<MutexGuard<ChannelDetails>> {
+        Some(self.channel_details.get(&id)?.lock().unwrap())
     }
 
     /// New Stream from Data Channel ID
@@ -414,13 +388,9 @@ impl<Stage> Connection<Stage> {
         &mut self,
         channel_id: ChannelId,
     ) -> Result<Stream, Error> {
-        let (stream, drop_listener, mut waker_rx, reply_rx) = Stream::new(
-            channel_id,
-            RtcDataChannelState::Open,
-            self.rtc.clone(),
-            self.tx_state_inquiry.clone(),
-        )
-        .map_err(|_| Error::StreamCreationFailed)?;
+        let (stream, drop_listener, mut waker_rx, reply_rx) =
+            Stream::new(channel_id, self.rtc.clone(), self.tx_state_inquiry.clone())
+                .map_err(|_| Error::StreamCreationFailed)?;
 
         let mut channel_details = ChannelDetails {
             state: RtcDataChannelState::Opening,
