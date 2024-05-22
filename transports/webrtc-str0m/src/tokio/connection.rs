@@ -196,11 +196,11 @@ pub struct Connection<Stage = Opening> {
     ///
     /// When a [PollDataChannel] is created, it will be passed a clone of this [Sender]
     /// `state_inquiry_channel.0.clone()` and will use it to send inquiries about the state of the channel.
-    tx_state_inquiry: Option<mpsc::Sender<StateInquiry>>,
+    tx_state_inquiry: mpsc::Sender<StateInquiry>,
 
     /// Receiver for state updates from a [PollDataChannel]. We only need one of these
     /// as this single Connection will be the only one sending updates.
-    tx_state_update: Option<mpsc::Sender<StateUpdate>>,
+    tx_state_update: mpsc::Sender<StateUpdate>,
 }
 
 impl<Stage> Unpin for Connection<Stage> {}
@@ -288,20 +288,16 @@ impl<Stage: Connectable> Connection<Stage> {
                         };
 
                         // set the channel state to Open RtcDataChannelState::Open;
-                        match self.tx_state_update.as_ref() {
-                            Some(tx) => {
-                                let message = StateUpdate {
-                                    channel_id,
-                                    state: RtcDataChannelState::Open,
-                                };
-                                tx.try_send(message).unwrap();
-                            }
-                            None => {
-                                tracing::error!(
-                                    "No state update channel for channel_id: {:?}",
-                                    channel_id
-                                );
-                            }
+                        let message = StateUpdate {
+                            channel_id,
+                            state: RtcDataChannelState::Open,
+                        };
+
+                        if let Err(e) = self.tx_state_update.try_send(message) {
+                            tracing::error!(
+                                "No state update channel for channel_id: {:?}",
+                                channel_id
+                            );
                         }
 
                         // Call any Stage specific handler for Channel Open event
@@ -338,20 +334,15 @@ impl<Stage: Connectable> Connection<Stage> {
                         );
 
                         // State Change to Closed
-                        match self.tx_state_update.as_ref() {
-                            Some(tx) => {
-                                let message = StateUpdate {
-                                    channel_id,
-                                    state: RtcDataChannelState::Closed,
-                                };
-                                tx.try_send(message).unwrap();
-                            }
-                            None => {
-                                tracing::error!(
-                                    "No state update channel for channel_id: {:?}",
-                                    channel_id
-                                );
-                            }
+                        let message = StateUpdate {
+                            channel_id,
+                            state: RtcDataChannelState::Closed,
+                        };
+                        if let Err(_e) = self.tx_state_update.try_send(message) {
+                            tracing::error!(
+                                "No state update channel for channel_id: {:?}",
+                                channel_id
+                            );
                         }
 
                         // if we do this here, PollDataChannel will not be able to
@@ -388,6 +379,13 @@ impl<Stage> Connection<Stage> {
 
         let local_address = socket.local_addr().unwrap();
 
+        // Make the state_inquiry channel
+        let (tx_state_inquiry, rx_state_inquiry) = mpsc::channel::<StateInquiry>(4);
+
+        let (tx_state_update, rx_state_update) = mpsc::channel::<StateUpdate>(1);
+
+        state_loop(rx_state_update, rx_state_inquiry);
+
         Self {
             rtc,
             socket,
@@ -401,8 +399,8 @@ impl<Stage> Connection<Stage> {
             drop_listeners: Default::default(),
             no_drop_listeners_waker: Default::default(),
             channel_details: Default::default(),
-            tx_state_inquiry: None,
-            tx_state_update: None,
+            tx_state_inquiry,
+            tx_state_update,
         }
     }
 
@@ -411,74 +409,16 @@ impl<Stage> Connection<Stage> {
         Arc::clone(&self.rtc)
     }
 
-    /// Spawns a tokio task which listens on the given mpsc receiver for incoming
-    /// inquiries about self.state of a channel_id, and responds with the current state.
-    pub fn state_loop(&mut self) {
-        // Make the state_inquiry channel
-        let (tx_state_inquiry, mut rx_state_inquiry) = mpsc::channel::<StateInquiry>(4);
-
-        let (tx_state_update, mut rx_state_update) = mpsc::channel::<StateUpdate>(1);
-
-        self.tx_state_inquiry = Some(tx_state_inquiry);
-        self.tx_state_update = Some(tx_state_update);
-
-        tokio::spawn(async move {
-            let mut channel_details: HashMap<ChannelId, RefCell<ChannelDetails>> = HashMap::new();
-            // lopp on tokio select on receiving state inquiries and updates
-            loop {
-                tokio::select! {
-                    Some(update) = rx_state_update.recv() => {
-                        // Update the state of the channel
-                        let mut channel_details = channel_details.get(&update.channel_id).expect("ChannelDetails should be present in the Connection struct for the channel_id").borrow_mut();
-                        channel_details.state = update.state;
-                    }
-                    Some(inquiry) = rx_state_inquiry.recv() => {
-                        // Respond with the current state of the channel, if it exists
-                        match channel_details.get(&inquiry.channel_id) {
-                            Some(deets) => {
-                                let deets = deets.borrow();
-                                match inquiry.response.send(deets.state.clone()) {
-                                    Ok(_) => {
-                                        if let RtcDataChannelState::Closed = deets.state {
-                                            drop(deets);
-                                            // Remove the channel from the channel_details
-                                            channel_details.remove(&inquiry.channel_id);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Failed to send channel state response: {:?}", e);
-                                    }
-                                }
-                            }
-                            None => {
-                                tracing::warn!("No channel details for channel_id: {:?}", inquiry.channel_id);
-                                // send opening state
-                                inquiry.response.send(RtcDataChannelState::Opening).unwrap();
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-
     /// New Stream from Data Channel ID
     pub fn new_stream_from_data_channel_id(
         &mut self,
         channel_id: ChannelId,
     ) -> Result<Stream, Error> {
-        // if self.tx_state_inquiry.is_none() throw an error "Did you start the state loop?"
-        let Some(tx_state_inquiry) = self.tx_state_inquiry.as_ref() else {
-            return Err(Error::Internal(
-                "No State Sender. Did you start the state loop?".to_string(),
-            ));
-        };
-
         let (stream, drop_listener, mut waker_rx, reply_rx) = Stream::new(
             channel_id,
             RtcDataChannelState::Open,
             self.rtc.clone(),
-            tx_state_inquiry.clone(),
+            self.tx_state_inquiry.clone(),
         )
         .map_err(|_| Error::StreamCreationFailed)?;
 
@@ -522,6 +462,50 @@ impl<Stage> Connection<Stage> {
     }
 }
 
+/// Spawns a tokio task which listens on the given mpsc receiver for incoming
+/// inquiries about self.state of a channel_id, and responds with the current state.
+pub fn state_loop(
+    mut rx_state_update: Receiver<StateUpdate>,
+    mut rx_state_inquiry: Receiver<StateInquiry>,
+) {
+    tokio::spawn(async move {
+        let mut channel_details: HashMap<ChannelId, RefCell<ChannelDetails>> = HashMap::new();
+        loop {
+            tokio::select! {
+                Some(update) = rx_state_update.recv() => {
+                    // Update the state of the channel
+                    let mut channel_details = channel_details.get(&update.channel_id).expect("ChannelDetails should be present in the Connection struct for the channel_id").borrow_mut();
+                    channel_details.state = update.state;
+                }
+                Some(inquiry) = rx_state_inquiry.recv() => {
+                    // Respond with the current state of the channel, if it exists
+                    match channel_details.get(&inquiry.channel_id) {
+                        Some(deets) => {
+                            let deets = deets.borrow();
+                            match inquiry.response.send(deets.state.clone()) {
+                                Ok(_) => {
+                                    if let RtcDataChannelState::Closed = deets.state {
+                                        drop(deets);
+                                        // Remove the channel from the channel_details
+                                        channel_details.remove(&inquiry.channel_id);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to send channel state response: {:?}", e);
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::warn!("No channel details for channel_id: {:?}", inquiry.channel_id);
+                            // send opening state
+                            inquiry.response.send(RtcDataChannelState::Opening).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
 /// WebRTC native multiplexing of [Open] [Connection]s.
 /// Allow users to open their substreams
 impl<Stage> StreamMuxer for Connection<Stage> {
