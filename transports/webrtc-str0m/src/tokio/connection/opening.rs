@@ -40,7 +40,7 @@ impl Connection<Opening> {
         let local_address = socket.local_addr().unwrap();
 
         // Make the state_inquiry channel
-        let (tx_state_inquiry, rx_state_inquiry) = mpsc::channel::<StateInquiry>(4);
+        let (tx_state_inquiry, rx_state_inquiry) = mpsc::channel::<Inquiry>(4);
 
         let (tx_state_update, rx_state_update) = mpsc::channel::<StateUpdate>(1);
 

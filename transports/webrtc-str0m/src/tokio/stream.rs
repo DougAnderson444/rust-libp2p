@@ -12,10 +12,10 @@ use send_wrapper::SendWrapper;
 use str0m::{channel::ChannelId, Rtc};
 use tokio::sync::mpsc;
 
-pub(crate) use super::channel::{ReadReady, StateInquiry};
+pub(crate) use super::channel::{ReadInquiry, StateInquiry};
 
 use super::{
-    channel::{ChannelWakers, RtcDataChannelState},
+    channel::{ChannelWakers, Inquiry, RtcDataChannelState},
     Error,
 };
 
@@ -33,23 +33,20 @@ impl Stream {
     pub(crate) fn new(
         channel_id: ChannelId,
         rtc: Arc<Mutex<Rtc>>,
-        tx_state_inquiry: mpsc::Sender<StateInquiry>,
+        tx_state_inquiry: mpsc::Sender<Inquiry>,
     ) -> Result<
         (
             Self,
             DropListener,
             futures::channel::mpsc::Receiver<ChannelWakers>,
-            Mutex<futures::channel::mpsc::Receiver<ReadReady>>,
         ),
         Error,
     > {
         let (send_wakers, wakers_rx) = futures::channel::mpsc::channel(1);
-        let (read_ready_signal, read_ready_rx) = futures::channel::mpsc::channel(1);
         let (inner, drop_listener) = libp2p_webrtc_utils::Stream::new(PollDataChannel::new(
             channel_id,
             rtc,
             send_wakers,
-            read_ready_signal,
             tx_state_inquiry,
         )?);
 
@@ -59,7 +56,6 @@ impl Stream {
             },
             drop_listener,
             wakers_rx,
-            Mutex::new(read_ready_rx),
         ))
     }
 }

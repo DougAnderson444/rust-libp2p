@@ -1,3 +1,8 @@
+use crate::tokio::channel::InquiryType;
+use crate::tokio::channel::{
+    ChannelWakers, Inquiry, ReadInquiry, RtcDataChannelState, StateInquiry,
+};
+use crate::tokio::Error;
 use futures::{AsyncRead, AsyncWrite, FutureExt};
 use libp2p_webrtc_utils::MAX_MSG_LEN;
 use std::cmp::min;
@@ -10,11 +15,6 @@ use str0m::channel::ChannelId;
 use str0m::Rtc;
 use tokio::sync::mpsc;
 use tokio_util::bytes::BytesMut;
-
-use crate::tokio::channel::{
-    ChannelWakers, ReadReady, RequestState, RtcDataChannelState, StateInquiry,
-};
-use crate::tokio::Error;
 
 /// [`PollDataChannel`] is a wrapper around around [`Rtc`], [`ChannelId`], and [`Connection`] which are needed to read and write, and thenit also implements [`AsyncRead`] and [`AsyncWrite`] to satify libp2p.
 // let channel = Arc::new(rtc.channel(*id).unwrap()).unwrap().write(data)
@@ -45,11 +45,8 @@ pub(crate) struct PollDataChannel {
     /// to drop the stream which resets it.
     overloaded: Arc<AtomicBool>,
 
-    /// Used to send a signal back to the Connection to indicate we are ready to read.
-    read_ready_signal: futures::channel::mpsc::Sender<ReadReady>,
-
     /// State change signal.
-    tx_state_inquiry: mpsc::Sender<StateInquiry>,
+    tx_state_inquiry: mpsc::Sender<Inquiry>,
 }
 
 impl PollDataChannel {
@@ -59,8 +56,7 @@ impl PollDataChannel {
         channel_id: ChannelId,
         rtc: Arc<Mutex<Rtc>>,
         send_wakers: futures::channel::mpsc::Sender<ChannelWakers>,
-        read_ready_signal: futures::channel::mpsc::Sender<ReadReady>,
-        tx_state_inquiry: mpsc::Sender<StateInquiry>,
+        tx_state_inquiry: mpsc::Sender<Inquiry>,
     ) -> Result<Self, Error> {
         // We purposely don't use `with_capacity` so we don't eagerly allocate `MAX_READ_BUFFER` per stream.
         let read_buffer = Arc::new(Mutex::new(BytesMut::new()));
@@ -78,24 +74,52 @@ impl PollDataChannel {
             wakers,
             read_buffer,
             overloaded,
-            read_ready_signal,
             tx_state_inquiry,
             state: RtcDataChannelState::Opening,
         })
     }
 
-    /// Polls the state of the data channel from the Connection.
-    fn poll_connection(
+    /// Polls the read buffer of the data channel from the Connection.
+    fn poll_read_buffer(
         &mut self,
-        inq: RequestState,
+        max_bytes: usize,
         cx: &mut Context,
-    ) -> Poll<Result<RtcDataChannelState, Error>> {
+    ) -> Poll<io::Result<Vec<u8>>> {
         let (tx, mut rx) = futures::channel::oneshot::channel();
 
-        let state_change = StateInquiry {
-            response: tx,
+        let state_change = Inquiry {
             channel_id: self.channel_id,
-            inquiry_type: inq,
+            ty: InquiryType::ReadBuffer(ReadInquiry {
+                response: tx,
+                max_bytes,
+            }),
+        };
+
+        if let Err(e) = self.tx_state_inquiry.try_send(state_change) {
+            tracing::error!("Failed to send state_change signal: {:?}", e);
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to send state_inquiry signal",
+            )));
+        }
+
+        // map to io::Error
+        rx.poll_unpin(cx).map_err(|e| {
+            tracing::error!("Failed to get read_buffer from Connection: {:?}", e);
+            io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to get read_buffer from Connection",
+            )
+        })
+    }
+
+    /// Polls the state of the data channel from the Connection.
+    fn poll_state(&mut self, cx: &mut Context) -> Poll<Result<RtcDataChannelState, Error>> {
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+
+        let state_change = Inquiry {
+            channel_id: self.channel_id,
+            ty: InquiryType::State(StateInquiry { response: tx }),
         };
 
         if let Err(e) = self.tx_state_inquiry.try_send(state_change) {
@@ -111,8 +135,7 @@ impl PollDataChannel {
 
     /// Whether the data channel is ready for reading or writing (Open).
     fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        let inquiry = RequestState::RtcState;
-        match self.poll_connection(inquiry, cx) {
+        match self.poll_state(cx) {
             Poll::Ready(Ok(RtcDataChannelState::Opening)) => {
                 self.state = RtcDataChannelState::Opening;
                 self.wakers.open.register(cx.waker());
@@ -151,30 +174,14 @@ impl AsyncRead for PollDataChannel {
 
         futures::ready!(this.poll_ready(cx))?;
 
-        // Get read_buffer.
-        // Send request (with embedded reply handle) to the Connection to get any new data.
-        let (tx, mut rx) = futures::channel::oneshot::channel();
-        let read_ready = ReadReady {
-            // channel_id: this.channel_id,
-            response: tx,
-        };
-
-        // Send it!
-        if let Err(e) = this.read_ready_signal.try_send(read_ready) {
-            tracing::error!("Failed to send read_ready signal: {:?}", e);
-            return Poll::Ready(Err(io::Error::new(
+        // Get read_buffer from the Connection
+        let input = futures::ready!(this.poll_read_buffer(buf.len(), cx)).map_err(|e| {
+            tracing::error!("Failed to get read_buffer from Connection: {:?}", e);
+            io::Error::new(
                 io::ErrorKind::Other,
-                "Failed to send read_ready signal",
-            )));
-        }
-
-        // listen on rx for the data from Connection response
-        let Ok(input) = futures::ready!(rx.poll_unpin(cx)) else {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Failed to get read buffer from Connection",
-            )));
-        };
+                "Failed to get read_buffer from Connection",
+            )
+        })?;
 
         // Handle empty scenario
         if input.is_empty() {

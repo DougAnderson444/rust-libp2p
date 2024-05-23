@@ -10,8 +10,6 @@ use tokio_util::bytes::BytesMut;
 pub(crate) struct ChannelDetails {
     /// The wakers for this channel_id
     pub(crate) wakers: ChannelWakers,
-    /// [ReadReady] channel data receiver.
-    pub(crate) channel_data_rx: Mutex<futures::channel::mpsc::Receiver<ReadReady>>,
     /// The current state of this channel id
     pub(crate) state: RtcDataChannelState,
     /// Read buffer where incoming data is stored until it is polled by PollDataChannel.
@@ -25,30 +23,42 @@ pub(crate) struct ChannelWakers {
     pub(crate) new_data: Arc<AtomicWaker>,
     /// New state of the DataChannel.
     pub(crate) open: Arc<AtomicWaker>,
-    /// Waker for when we are waiting for the DC to be written to.
-    pub(crate) write: Arc<AtomicWaker>,
     /// CLose waker, wakes when state is Closed.
     pub(crate) close: Arc<AtomicWaker>,
 }
 
+/// Enum for Inquiry types: Either State or ReadBuffer
+#[derive(Debug)]
+pub(crate) struct Inquiry {
+    /// The channel id we want to know about
+    pub(crate) channel_id: ChannelId,
+    /// Inquiry for the read buffer of the DataChannel.
+    pub(crate) ty: InquiryType,
+}
+
+/// Enum for Inquiry types: Either State or ReadBuffer
+#[derive(Debug)]
+pub(crate) enum InquiryType {
+    /// Inquiry for the state of the DataChannel.
+    State(StateInquiry),
+    /// Inquiry for the read buffer of the DataChannel.
+    ReadBuffer(ReadInquiry),
+}
 /// Encapsulates State changes for the DataChannel sent form the Connection.
 #[derive(Debug)]
 pub(crate) struct StateInquiry {
-    /// The channel id we want to know about
-    pub(crate) channel_id: ChannelId,
     /// The new state of the DataChannel.
     pub(crate) response: futures::channel::oneshot::Sender<RtcDataChannelState>,
-    /// The Type of State Inquiry.
-    pub(crate) inquiry_type: RequestState,
 }
 
-/// Enum to Update the state type: Either RtcState, ReadBuffer
+/// Simple struct to indicate that the channel is ready to read. Has a reply oneshot channel
+/// embedded so that [crate::tokio::Connection] can send the read_buffer back to the [PollDataChannel].
 #[derive(Debug)]
-pub(crate) enum RequestState {
-    /// The state of the DataChannel.
-    RtcState,
-    /// The read buffer of the DataChannel.
-    ReadBuffer,
+pub(crate) struct ReadInquiry {
+    /// The reply channel to send the read_buffer back to the [PollDataChannel].
+    pub(crate) response: futures::channel::oneshot::Sender<Vec<u8>>,
+    /// Max Bytes length to read (the size of the buffer we have available)
+    pub(crate) max_bytes: usize,
 }
 
 /// Enum for the response of [RequestState] containing the request type and the response value
@@ -67,16 +77,6 @@ pub(crate) struct StateUpdate {
     pub(crate) channel_id: ChannelId,
     /// The new state of the DataChannel.
     pub(crate) state: StateValues,
-}
-
-/// Simple struct to indicate that the channel is ready to read. Has a reply oneshot channel
-/// embedded so that [crate::tokio::Connection] can send the read_buffer back to the [PollDataChannel].
-#[derive(Debug)]
-pub(crate) struct ReadReady {
-    // /// The channel id of the channel that is ready to read.
-    // pub(crate) channel_id: ChannelId,
-    /// The reply channel to send the read_buffer back to the [PollDataChannel].
-    pub(crate) response: futures::channel::oneshot::Sender<Vec<u8>>,
 }
 
 /// Channel state.

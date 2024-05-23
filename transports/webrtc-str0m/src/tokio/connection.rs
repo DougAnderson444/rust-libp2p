@@ -12,14 +12,15 @@ mod opening;
 
 pub(crate) use self::open::{Open, OpenConfig};
 pub(crate) use self::opening::Opening;
-use crate::tokio::channel::{RequestState, StateValues};
+use crate::tokio::channel::{InquiryType, StateValues};
 use crate::tokio::fingerprint::Fingerprint;
 use crate::tokio::UdpSocket;
 
 use futures::stream::FuturesUnordered;
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
 use libp2p_identity::PeerId;
+use std::borrow::BorrowMut;
 use std::cell::RefCell;
 use std::sync::MutexGuard;
 use std::task::{ready, Context, Poll, Waker};
@@ -40,9 +41,7 @@ use tokio::sync::mpsc::{self, Receiver};
 
 use crate::tokio::Error;
 
-use super::channel::{
-    ChannelDetails, ChannelWakers, RtcDataChannelState, StateInquiry, StateUpdate,
-};
+use super::channel::{ChannelDetails, Inquiry, RtcDataChannelState, StateUpdate};
 use super::stream::{DropListener, Stream};
 
 /// The size of the buffer for incoming datagrams.
@@ -197,8 +196,8 @@ pub struct Connection<Stage = Opening> {
     /// each channel, as each channel has a unique state.
     ///
     /// When a [PollDataChannel] is created, it will be passed a clone of this [Sender]
-    /// `state_inquiry_channel.0.clone()` and will use it to send inquiries about the state of the channel.
-    tx_state_inquiry: mpsc::Sender<StateInquiry>,
+    // / `state_inquiry_channel.0.clone()` and will use it to send inquiries about the state of the channel.
+    tx_state_inquiry: mpsc::Sender<Inquiry>,
 
     /// Receiver for state updates from a [PollDataChannel]. We only need one of these
     /// as this single Connection will be the only one sending updates.
@@ -291,8 +290,9 @@ impl<Stage: Connectable> Connection<Stage> {
 
                         if let Err(e) = self.tx_state_update.try_send(message) {
                             tracing::error!(
-                                "No state update channel for channel_id: {:?}",
-                                channel_id
+                                "No state update channel for channel_id: {:?}, {:?}",
+                                channel_id,
+                                e
                             );
                         }
 
@@ -308,42 +308,65 @@ impl<Stage: Connectable> Connection<Stage> {
                         // Data goes from this Connection
                         // into the read_buffer for PollDataChannel for this channel_id
 
-                        let channel_details = self.channel_details.get(&data.id).expect(
-                            "ChannelDetails should be present in the Connection struct for the channel_id",
-                        ).lock().unwrap();
-
-                        channel_details.wakers.new_data.wake();
-
-                        // Wait on the reply handle to reply with data
-                        match channel_details.channel_data_rx.lock().unwrap().try_next() {
-                            Ok(Some(rx)) => {
-                                rx.response.send(data.data.clone()).unwrap();
+                        match self.channel_details.get(&data.id) {
+                            None => {
+                                tracing::error!("No channel details for channel_id: {:?}", data.id);
                             }
-                            _ => {
-                                tracing::error!(
-                                    "No channel data receiver for channel_id: {:?}",
-                                    data.id
-                                );
+                            Some(deets) => {
+                                // send to state_loop then wake the PollDataChannel
+                                let message = StateUpdate {
+                                    channel_id: data.id,
+                                    state: StateValues::ReadBuffer(data.data.clone()),
+                                };
+
+                                if let Err(e) = self.tx_state_update.try_send(message) {
+                                    tracing::error!(
+                                        "No state update channel for channel_id: {:?}, {:?}",
+                                        data.id,
+                                        e
+                                    );
+                                }
+
+                                // wake the PollDataChannel using deets
+                                deets.lock().unwrap().wakers.new_data.wake();
                             }
                         }
 
                         self.stage.on_event_channel_data(data)
                     }
                     Event::ChannelClose(channel_id) => {
-                        let channel_details = self.channel_details.get(&channel_id).expect(
-                            "ChannelDetails should be present in the Connection struct for the channel_id",
+                        tracing::trace!(
+                            target: LOG_TARGET,
+                            // connection_id = ?self.connection_id,
+                            ?channel_id,
+                            "channel closed",
                         );
 
-                        // State Change to Closed
-                        let message = StateUpdate {
-                            channel_id,
-                            state: StateValues::RtcState(RtcDataChannelState::Closed),
-                        };
-                        if let Err(_e) = self.tx_state_update.try_send(message) {
-                            tracing::error!(
-                                "No state update channel for channel_id: {:?}",
-                                channel_id
-                            );
+                        match self.channel_details.get(&channel_id) {
+                            None => {
+                                tracing::error!(
+                                    "No channel details for channel_id: {:?}",
+                                    channel_id
+                                );
+                            }
+                            Some(deets) => {
+                                // send to state_loop then wake the PollDataChannel
+                                let message = StateUpdate {
+                                    channel_id,
+                                    state: StateValues::RtcState(RtcDataChannelState::Closed),
+                                };
+
+                                if let Err(e) = self.tx_state_update.try_send(message) {
+                                    tracing::error!(
+                                        "No state update channel for channel_id: {:?}, {:?}",
+                                        channel_id,
+                                        e
+                                    );
+                                }
+
+                                // wake the PollDataChannel using deets
+                                deets.lock().unwrap().wakers.open.wake();
+                            }
                         }
 
                         // if we do this here, PollDataChannel will not be able to
@@ -389,7 +412,7 @@ impl<Stage> Connection<Stage> {
         &mut self,
         channel_id: ChannelId,
     ) -> Result<Stream, Error> {
-        let (stream, drop_listener, mut waker_rx, reply_rx) =
+        let (stream, drop_listener, mut waker_rx) =
             Stream::new(channel_id, self.rtc.clone(), self.tx_state_inquiry.clone())
                 .map_err(|_| Error::StreamCreationFailed)?;
 
@@ -401,7 +424,6 @@ impl<Stage> Connection<Stage> {
                     Mutex::new(ChannelDetails {
                         state: RtcDataChannelState::Opening,
                         wakers,
-                        channel_data_rx: reply_rx,
                         read_buffer: Default::default(),
                     }),
                 );
@@ -436,7 +458,7 @@ impl<Stage> Connection<Stage> {
 /// inquiries about self.state of a channel_id, and responds with the current state.
 pub(crate) fn state_loop(
     mut rx_state_update: Receiver<StateUpdate>,
-    mut rx_state_inquiry: Receiver<StateInquiry>,
+    mut rx_state_inquiry: Receiver<Inquiry>,
 ) {
     tokio::spawn(async move {
         let mut channel_details: HashMap<ChannelId, RefCell<ChannelDetails>> = HashMap::new();
@@ -456,27 +478,52 @@ pub(crate) fn state_loop(
                     }
                 }
                 Some(inquiry) = rx_state_inquiry.recv() => {
-                    // Respond with the current state of the channel, if it exists
-                    match channel_details.get(&inquiry.channel_id) {
-                        Some(deets) => {
-                            let deets = deets.borrow();
-                            match inquiry.response.send(deets.state.clone()) {
-                                Ok(_) => {
-                                    if let RtcDataChannelState::Closed = deets.state {
-                                        drop(deets);
-                                        // Remove the channel from the channel_details
-                                        channel_details.remove(&inquiry.channel_id);
+                    // match on the inquiry type first,
+                    // if no channel_details, return an error using the inquiry response channel of
+                    // the ty.
+                    match inquiry.ty {
+                        InquiryType::State(state_inquiry) => {
+                            match channel_details.get(&inquiry.channel_id) {
+                                None => {
+                                    if let Err(err) = state_inquiry.response.send(RtcDataChannelState::Closed) {
+                                        tracing::error!("Failed to send state inquiry response: {:?}", err);
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::error!("Failed to send channel state response: {:?}", e);
+                                Some(deets) => {
+                                    let borrowed_details = deets.borrow_mut();
+                                    // Err if fail, remove channel_id from HashMap if Closed was sent
+                                    match state_inquiry.response.send(borrowed_details.state.clone()) {
+                                        Err(err) => {
+                                            tracing::error!("Failed to send state inquiry response: {:?}", err);
+                                        }
+                                        Ok(_) => {
+                                            if borrowed_details.state == RtcDataChannelState::Closed {
+                                                drop(borrowed_details);
+                                                channel_details.borrow_mut().remove(&inquiry.channel_id);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
-                        None => {
-                            tracing::warn!("No channel details for channel_id: {:?}", inquiry.channel_id);
-                            // send opening state
-                            inquiry.response.send(RtcDataChannelState::Opening).unwrap();
+                        InquiryType::ReadBuffer(read_inquiry) => {
+                            match channel_details.get(&inquiry.channel_id) {
+                                None => {
+                                    if let Err(err) = read_inquiry.response.send(Vec::new()) {
+                                        tracing::error!("Failed to send read inquiry response: {:?}", err);
+                                    }
+                                }
+                                Some(channel_details) => {
+                                    let channel_details = channel_details.borrow();
+                                    // split the bead_buffer at inquiry.max_bytes
+                                    let mut read_buffer = channel_details.read_buffer.lock().unwrap();
+                                    let split_index = std::cmp::min(read_buffer.len(), read_inquiry.max_bytes);
+                                    let bytes_to_return = read_buffer.split_to(split_index);
+                                    if let Err(err) = read_inquiry.response.send(bytes_to_return.to_vec()) {
+                                        tracing::error!("Failed to send read inquiry response: {:?}", err);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
