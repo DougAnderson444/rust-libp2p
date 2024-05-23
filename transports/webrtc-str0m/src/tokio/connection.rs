@@ -296,6 +296,15 @@ impl<Stage: Connectable> Connection<Stage> {
                             );
                         }
 
+                        // Also notify StreamMuxer using tx_ondatachannel
+                        if let Err(e) = self
+                            .tx_ondatachannel
+                            .try_send(channel_id)
+                            .map_err(|_| Error::Disconnected)
+                        {
+                            tracing::error!("Failed to send channel_id to StreamMuxer: {:?}", e);
+                        }
+
                         // shake open waker to prompt PollDataChannel to re-poll
                         if let Some(ch) = self.channel(channel_id) {
                             ch.wakers.open.wake()
@@ -533,7 +542,7 @@ pub(crate) fn state_loop(
 }
 /// WebRTC native multiplexing of [Open] [Connection]s.
 /// Allow users to open their substreams
-impl<Stage> StreamMuxer for Connection<Stage> {
+impl StreamMuxer for Connection<Open> {
     type Substream = Stream;
     type Error = Error;
 

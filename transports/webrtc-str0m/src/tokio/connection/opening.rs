@@ -35,7 +35,7 @@ impl Connection<Opening> {
     pub fn new(rtc: Arc<Mutex<Rtc>>, socket: Arc<UdpSocket>, source: SocketAddr) -> Self {
         // Create a channel for sending datagrams to the connection event handler.
         let (relay_dgram, dgram_rx) = mpsc::channel(DATAGRAM_BUFFER_SIZE);
-        let (tx_ondatachannel, rx_ondatachannel) = futures::channel::mpsc::channel(1);
+        let (tx_ondatachannel, rx_ondatachannel) = futures::channel::mpsc::channel(4);
 
         let local_address = socket.local_addr().unwrap();
 
