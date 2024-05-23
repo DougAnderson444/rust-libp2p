@@ -296,7 +296,7 @@ impl<Stage: Connectable> Connection<Stage> {
                             );
                         }
 
-                        // Also notify StreamMuxer using tx_ondatachannel
+                        // notify StreamMuxer using tx_ondatachannel
                         if let Err(e) = self
                             .tx_ondatachannel
                             .try_send(channel_id)
