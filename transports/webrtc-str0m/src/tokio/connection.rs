@@ -12,6 +12,7 @@ mod opening;
 
 pub(crate) use self::open::{Open, OpenConfig};
 pub(crate) use self::opening::Opening;
+use crate::tokio::channel::{RequestState, StateValues};
 use crate::tokio::fingerprint::Fingerprint;
 use crate::tokio::UdpSocket;
 
@@ -285,7 +286,7 @@ impl<Stage: Connectable> Connection<Stage> {
                         // set the channel state to Open RtcDataChannelState::Open;
                         let message = StateUpdate {
                             channel_id,
-                            state: RtcDataChannelState::Open,
+                            state: StateValues::RtcState(RtcDataChannelState::Open),
                         };
 
                         if let Err(e) = self.tx_state_update.try_send(message) {
@@ -336,7 +337,7 @@ impl<Stage: Connectable> Connection<Stage> {
                         // State Change to Closed
                         let message = StateUpdate {
                             channel_id,
-                            state: RtcDataChannelState::Closed,
+                            state: StateValues::RtcState(RtcDataChannelState::Closed),
                         };
                         if let Err(_e) = self.tx_state_update.try_send(message) {
                             tracing::error!(
@@ -392,16 +393,18 @@ impl<Stage> Connection<Stage> {
             Stream::new(channel_id, self.rtc.clone(), self.tx_state_inquiry.clone())
                 .map_err(|_| Error::StreamCreationFailed)?;
 
-        let mut channel_details = ChannelDetails {
-            state: RtcDataChannelState::Opening,
-            wakers: ChannelWakers::default(),
-            channel_data_rx: reply_rx,
-        };
-
         match waker_rx.try_next() {
             Ok(Some(wakers)) => {
                 // Track the waker and the drop listener for this channel
-                channel_details.wakers = wakers;
+                self.channel_details.insert(
+                    channel_id,
+                    Mutex::new(ChannelDetails {
+                        state: RtcDataChannelState::Opening,
+                        wakers,
+                        channel_data_rx: reply_rx,
+                        read_buffer: Default::default(),
+                    }),
+                );
             }
             Ok(None) => {
                 tracing::debug!("Channel sent no wakers, that's weird");
@@ -410,9 +413,6 @@ impl<Stage> Connection<Stage> {
                 tracing::error!("Failed to receive wakers from PollDataChanell: {:?}", e);
             }
         }
-
-        self.channel_details
-            .insert(channel_id, Mutex::new(channel_details));
 
         // The Stream also gives us the mpsc::Receiver<ReadReady>
         // to send data to the PollDataChannel, we need to store this
@@ -434,7 +434,7 @@ impl<Stage> Connection<Stage> {
 
 /// Spawns a tokio task which listens on the given mpsc receiver for incoming
 /// inquiries about self.state of a channel_id, and responds with the current state.
-pub fn state_loop(
+pub(crate) fn state_loop(
     mut rx_state_update: Receiver<StateUpdate>,
     mut rx_state_inquiry: Receiver<StateInquiry>,
 ) {
@@ -445,7 +445,15 @@ pub fn state_loop(
                 Some(update) = rx_state_update.recv() => {
                     // Update the state of the channel
                     let mut channel_details = channel_details.get(&update.channel_id).expect("ChannelDetails should be present in the Connection struct for the channel_id").borrow_mut();
-                    channel_details.state = update.state;
+                    match update.state {
+                        StateValues::RtcState(state) => {
+                            channel_details.state = state;
+                        }
+                        StateValues::ReadBuffer(data) => {
+                            let mut read_buffer = channel_details.read_buffer.lock().unwrap();
+                            read_buffer.extend_from_slice(&data);
+                        }
+                    }
                 }
                 Some(inquiry) = rx_state_inquiry.recv() => {
                     // Respond with the current state of the channel, if it exists

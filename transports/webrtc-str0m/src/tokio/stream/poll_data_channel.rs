@@ -11,7 +11,9 @@ use str0m::Rtc;
 use tokio::sync::mpsc;
 use tokio_util::bytes::BytesMut;
 
-use crate::tokio::channel::{ChannelWakers, ReadReady, RtcDataChannelState, StateInquiry};
+use crate::tokio::channel::{
+    ChannelWakers, ReadReady, RequestState, RtcDataChannelState, StateInquiry,
+};
 use crate::tokio::Error;
 
 /// [`PollDataChannel`] is a wrapper around around [`Rtc`], [`ChannelId`], and [`Connection`] which are needed to read and write, and thenit also implements [`AsyncRead`] and [`AsyncWrite`] to satify libp2p.
@@ -82,13 +84,18 @@ impl PollDataChannel {
         })
     }
 
-    /// Polls the state of the data channel.
-    fn poll_state(&mut self, cx: &mut Context) -> Poll<Result<RtcDataChannelState, Error>> {
+    /// Polls the state of the data channel from the Connection.
+    fn poll_connection(
+        &mut self,
+        inq: RequestState,
+        cx: &mut Context,
+    ) -> Poll<Result<RtcDataChannelState, Error>> {
         let (tx, mut rx) = futures::channel::oneshot::channel();
 
         let state_change = StateInquiry {
             response: tx,
             channel_id: self.channel_id,
+            inquiry_type: inq,
         };
 
         if let Err(e) = self.tx_state_inquiry.try_send(state_change) {
@@ -104,7 +111,8 @@ impl PollDataChannel {
 
     /// Whether the data channel is ready for reading or writing (Open).
     fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        match self.poll_state(cx) {
+        let inquiry = RequestState::RtcState;
+        match self.poll_connection(inquiry, cx) {
             Poll::Ready(Ok(RtcDataChannelState::Opening)) => {
                 self.state = RtcDataChannelState::Opening;
                 self.wakers.open.register(cx.waker());
@@ -161,15 +169,12 @@ impl AsyncRead for PollDataChannel {
         }
 
         // listen on rx for the data from Connection response
-        let input = futures::ready!(rx.poll_unpin(cx)).unwrap();
-
-        // There are two scenarios here:
-        // 1. We are asking the Connection if they have any data for us, and they don't.
-        // In which case they will reply with an empty Vec<u8> and we will
-        // register the waker and return Poll::Pending
-        //
-        // 2. We are asking the Connection if they have any data for us, and they do.
-        // In which case they will reply with a Vec<u8> and we will return Poll::Ready(Ok(len))
+        let Ok(input) = futures::ready!(rx.poll_unpin(cx)) else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to get read buffer from Connection",
+            )));
+        };
 
         // Handle empty scenario
         if input.is_empty() {

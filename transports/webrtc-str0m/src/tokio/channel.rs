@@ -4,6 +4,7 @@
 use futures::task::AtomicWaker;
 use std::sync::{Arc, Mutex};
 use str0m::channel::ChannelId;
+use tokio_util::bytes::BytesMut;
 
 #[derive(Debug)]
 pub(crate) struct ChannelDetails {
@@ -13,6 +14,8 @@ pub(crate) struct ChannelDetails {
     pub(crate) channel_data_rx: Mutex<futures::channel::mpsc::Receiver<ReadReady>>,
     /// The current state of this channel id
     pub(crate) state: RtcDataChannelState,
+    /// Read buffer where incoming data is stored until it is polled by PollDataChannel.
+    pub(crate) read_buffer: Arc<Mutex<BytesMut>>,
 }
 
 /// Wakers for the different types of wakers
@@ -35,6 +38,26 @@ pub(crate) struct StateInquiry {
     pub(crate) channel_id: ChannelId,
     /// The new state of the DataChannel.
     pub(crate) response: futures::channel::oneshot::Sender<RtcDataChannelState>,
+    /// The Type of State Inquiry.
+    pub(crate) inquiry_type: RequestState,
+}
+
+/// Enum to Update the state type: Either RtcState, ReadBuffer
+#[derive(Debug)]
+pub(crate) enum RequestState {
+    /// The state of the DataChannel.
+    RtcState,
+    /// The read buffer of the DataChannel.
+    ReadBuffer,
+}
+
+/// Enum for the response of [RequestState] containing the request type and the response value
+#[derive(Debug)]
+pub(crate) enum StateValues {
+    /// The state of the DataChannel.
+    RtcState(RtcDataChannelState),
+    /// The read buffer of the DataChannel.
+    ReadBuffer(Vec<u8>),
 }
 
 /// State Update, includes the channel id and the new state.
@@ -43,7 +66,7 @@ pub(crate) struct StateUpdate {
     /// The channel id we want to know about
     pub(crate) channel_id: ChannelId,
     /// The new state of the DataChannel.
-    pub(crate) state: RtcDataChannelState,
+    pub(crate) state: StateValues,
 }
 
 /// Simple struct to indicate that the channel is ready to read. Has a reply oneshot channel
