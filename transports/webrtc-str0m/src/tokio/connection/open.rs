@@ -2,8 +2,6 @@
 
 use super::*;
 
-use futures::channel::mpsc;
-
 /// The Open Connection state.
 #[derive(Debug)]
 pub struct Open {
@@ -43,23 +41,6 @@ impl Connectable for Open {
         self.handshake_state.clone()
     }
 
-    fn on_output_transmit(
-        &mut self,
-        socket: Arc<UdpSocket>,
-        transmit: str0m::net::Transmit,
-    ) -> Self::Output {
-        tracing::trace!(
-            target: LOG_TARGET,
-            "transmit data",
-        );
-
-        socket
-            .try_send_to(&transmit.contents, transmit.destination)
-            .expect("send data");
-
-        None
-    }
-
     /// Return [WebRtcEvent::ConnectionClosed] when an error occurs.
     fn on_rtc_error(&mut self, error: str0m::RtcError) -> Self::Output {
         tracing::error!(
@@ -93,13 +74,6 @@ impl Connectable for Open {
         None
     }
 
-    /// [Connection] is [Open] and got a [`str0m::Event::ChannelData`] ([`str0m::channel::ChannelData`]),
-    /// this function passes that to [Connection] [StreamMuxer] Substream for streaming data.
-    fn on_event_channel_data(&mut self, channel: ChannelData) -> Self::Output {
-        // get the channel.id from self.channels
-        todo!()
-    }
-
     fn on_event_channel_close(&mut self, _channel_id: ChannelId) -> Self::Output {
         todo!()
     }
@@ -129,7 +103,32 @@ impl Connection<Open> {
     /// Runs the main str0m input handler
     /// which is a connection loop to deal with Transmission and Events
     pub async fn run(&mut self) {
+        tracing::trace!(
+            target: LOG_TARGET,
+            // peer = ?self.peer, // TODO: Move peer to connection?
+            "start webrtc connection event loop",
+        );
         loop {
+            // poll output until we get a timeout
+            let Some(timeout) = self.rtc_poll_output() else {
+                tracing::trace!(
+                    target: LOG_TARGET,
+                    peer = ?self.stage.peer,
+                    "connection closed",
+                );
+                return self.on_connection_closed().await;
+            };
+
+            let duration = timeout - Instant::now();
+            if duration.is_zero() {
+                self.rtc()
+                    .lock()
+                    .unwrap()
+                    .handle_input(Input::Timeout(Instant::now()))
+                    .unwrap();
+                continue;
+            }
+
             // Do something
             tokio::select! {
                             biased;
@@ -159,6 +158,9 @@ impl Connection<Open> {
                                     return self.on_connection_closed().await;
                                 }
                             },
+                            _ = tokio::time::sleep(duration) => {
+                                self.rtc().lock().unwrap().handle_input(Input::Timeout(Instant::now())).unwrap();
+                            }
             }
             todo!();
         }

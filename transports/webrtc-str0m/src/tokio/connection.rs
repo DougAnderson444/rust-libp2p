@@ -41,7 +41,7 @@ use tokio::sync::mpsc::{self, Receiver};
 
 use crate::tokio::Error;
 
-use super::channel::{ChannelDetails, Inquiry, RtcDataChannelState, StateUpdate};
+use super::channel::{ChannelDetails, ChannelWakers, Inquiry, RtcDataChannelState, StateUpdate};
 use super::stream::{DropListener, Stream};
 
 /// The size of the buffer for incoming datagrams.
@@ -51,18 +51,15 @@ const DATAGRAM_BUFFER_SIZE: usize = 1024;
 const LOG_TARGET: &str = "libp2p_webrtc_str0m";
 
 pub trait Connectable {
-    type Output;
+    type Output: Default;
+
+    // enable implementations to return Output default
+    fn default() -> Self::Output {
+        Default::default()
+    }
 
     /// Returns the [`HandshakeState`] of the connection.
     fn handshake_state(&self) -> HandshakeState;
-
-    /// On transmit data, with associate type for the return output
-    /// Handle [`str0m::Output::Transmit`] events.
-    fn on_output_transmit(
-        &mut self,
-        socket: Arc<UdpSocket>,
-        transmit: str0m::net::Transmit,
-    ) -> Self::Output;
 
     /// Handle Rtc Errors
     fn on_rtc_error(&mut self, error: str0m::RtcError) -> Self::Output;
@@ -73,11 +70,9 @@ pub trait Connectable {
     /// Handles [`str0m::Event::IceConnectionStateChange`] `IceConnectionStateChange::disonnected` event.
     fn on_event_ice_disconnect(&self) -> Self::Output;
 
-    /// Handles [`str0m::Event::ChannelOpen`] events
+    /// Handles [`str0m::Event::ChannelOpen`] events.
+    /// Opening handles remote fingerprint, open does nothing.
     fn on_event_channel_open(&mut self, channel_id: ChannelId, name: String) -> Self::Output;
-
-    /// Handles [`str0m::Event::ChannelData`] events
-    fn on_event_channel_data(&mut self, data: ChannelData) -> Self::Output;
 
     /// Handles [`str0m::Event::ChannelClose`] events
     fn on_event_channel_close(&mut self, channel_id: ChannelId) -> Self::Output;
@@ -102,10 +97,15 @@ pub enum OpeningEvent {
     ConnectionClosed,
 
     /// Connection established.
-    ConnectionOpened {
-        remote_fingerprint: Fingerprint,
-    },
+    ConnectionOpened { remote_fingerprint: Fingerprint },
+    /// This is the default
     None,
+}
+
+impl Default for OpeningEvent {
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 /// Opening Connection state.
@@ -262,7 +262,20 @@ impl<Stage: Connectable> Connection<Stage> {
         };
         match out {
             Output::Transmit(transmit) => {
-                self.stage.on_output_transmit(self.socket.clone(), transmit)
+                if let Err(error) = self
+                    .socket
+                    .try_send_to(&transmit.contents, transmit.destination)
+                {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        ?error,
+                        "failed to send connection datagram",
+                    );
+
+                    // TODO: return Broken Pipe?
+                }
+
+                <Stage as crate::tokio::connection::Connectable>::Output::default()
             }
             Output::Timeout(timeout) => self.stage.on_output_timeout(self.rtc(), timeout),
             Output::Event(e) => {
@@ -311,11 +324,16 @@ impl<Stage: Connectable> Connection<Stage> {
                         }
 
                         // Call any Stage specific handler for Channel Open event
-                        self.stage.on_event_channel_open(channel_id, name)
+                        <Stage as crate::tokio::connection::Connectable>::Output::default()
                     }
                     Event::ChannelData(data) => {
                         // Data goes from this Connection
                         // into the read_buffer for PollDataChannel for this channel_id
+                        // through the state_loop.
+                        tracing::trace!(
+                            ?data.id,
+                            "channel data",
+                        );
 
                         match self.channel_details.get(&data.id) {
                             None => {
@@ -341,7 +359,7 @@ impl<Stage: Connectable> Connection<Stage> {
                             }
                         }
 
-                        self.stage.on_event_channel_data(data)
+                        <Stage as crate::tokio::connection::Connectable>::Output::default()
                     }
                     Event::ChannelClose(channel_id) => {
                         tracing::trace!(
@@ -421,37 +439,25 @@ impl<Stage> Connection<Stage> {
         &mut self,
         channel_id: ChannelId,
     ) -> Result<Stream, Error> {
-        let (stream, drop_listener, mut waker_rx) =
-            Stream::new(channel_id, self.rtc.clone(), self.tx_state_inquiry.clone())
-                .map_err(|_| Error::StreamCreationFailed)?;
+        let wakers = ChannelWakers::default();
 
-        match waker_rx.try_next() {
-            Ok(Some(wakers)) => {
-                // Track the waker and the drop listener for this channel
-                self.channel_details.insert(
-                    channel_id,
-                    Mutex::new(ChannelDetails {
-                        state: RtcDataChannelState::Opening,
-                        wakers,
-                        read_buffer: Default::default(),
-                    }),
-                );
-            }
-            Ok(None) => {
-                tracing::debug!("Channel sent no wakers, that's weird");
-            }
-            Err(e) => {
-                tracing::error!("Failed to receive wakers from PollDataChanell: {:?}", e);
-            }
-        }
+        let (stream, drop_listener) = Stream::new(
+            channel_id,
+            self.rtc.clone(),
+            self.tx_state_inquiry.clone(),
+            wakers.clone(),
+        )
+        .map_err(|_| Error::StreamCreationFailed)?;
 
-        // The Stream also gives us the mpsc::Receiver<ReadReady>
-        // to send data to the PollDataChannel, we need to store this
-        // in self so we can rx.try_next() to know when to reply
-        // with the data once the waker as woken the; PollDataChannel poller
-        // self.channel_data_rx.insert(channel_id, reply_rx);
+        self.channel_details.insert(
+            channel_id,
+            Mutex::new(ChannelDetails {
+                state: RtcDataChannelState::Opening,
+                wakers,
+                read_buffer: Default::default(),
+            }),
+        );
 
-        // Track the drop listener
         // TODO: Verify that noise channels are dropped correctly from this list
         self.drop_listeners.push(drop_listener);
 

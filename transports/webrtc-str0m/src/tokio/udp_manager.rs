@@ -71,7 +71,7 @@ pub(crate) struct UDPManager {
     listen_addr: SocketAddr,
 
     /// All the address connections we are tracking.
-    addr_conns: HashMap<SocketAddr, Arc<Mutex<Connection>>>,
+    pub(crate) addr_conns: HashMap<SocketAddr, Arc<Mutex<Connection>>>,
 }
 
 /// Whether this is a new connection that should be Polled or not.
@@ -84,11 +84,6 @@ impl UDPManager {
     /// Getter for socket
     pub(crate) fn socket(&self) -> Arc<UdpSocket> {
         self.socket.clone()
-    }
-
-    /// Adds an address to addr_conns.
-    pub(crate) fn add_connection(&mut self, addr: SocketAddr, connection: Arc<Mutex<Connection>>) {
-        self.addr_conns.insert(addr, connection);
     }
 
     /// Creates a new `UDPManager` with the given address.
@@ -198,17 +193,38 @@ impl UDPManager {
         }
 
         // 2) Otherwise we haven't seen this source address before, it should be Stun, and we return the ICE creds (ufrag, pass)
-        let binding = StunMessage::parse(&buffer)
-            .map_err(|op| Error::NetError(str0m::error::NetError::Stun(op)))?;
+        match StunMessage::parse(buffer) {
+            // .map_err(|op| Error::NetError(str0m::error::NetError::Stun(op)))?;
+            Ok(stun) => {
+                let (ufrag, pass) = stun
+                    .split_username()
+                    .ok_or(Error::Authentication)
+                    .map_err(|_| Error::InvalidData)?;
 
-        let (ufrag, pass) = binding
-            .split_username()
-            .ok_or(Error::Authentication)
-            .map_err(|_| Error::InvalidData)?;
+                Ok(NewSource::Yes(IceCreds {
+                    ufrag: ufrag.to_owned(),
+                    pass: pass.to_owned(),
+                }))
+            }
+            Err(_not_stun) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    "received non-stun message while opening from source: {}",
+                    source,
+                );
+                // TODO: Input::Receive and handle_input? of non-stun?
 
-        Ok(NewSource::Yes(IceCreds {
-            ufrag: ufrag.to_owned(),
-            pass: pass.to_owned(),
-        }))
+                Ok(NewSource::No)
+            }
+        }
+        // let (ufrag, pass) = binding
+        //     .split_username()
+        //     .ok_or(Error::Authentication)
+        //     .map_err(|_| Error::InvalidData)?;
+        //
+        // Ok(NewSource::Yes(IceCreds {
+        //     ufrag: ufrag.to_owned(),
+        //     pass: pass.to_owned(),
+        // }))
     }
 }

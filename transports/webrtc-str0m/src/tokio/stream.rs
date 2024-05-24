@@ -34,19 +34,12 @@ impl Stream {
         channel_id: ChannelId,
         rtc: Arc<Mutex<Rtc>>,
         tx_state_inquiry: mpsc::Sender<Inquiry>,
-    ) -> Result<
-        (
-            Self,
-            DropListener,
-            futures::channel::mpsc::Receiver<ChannelWakers>,
-        ),
-        Error,
-    > {
-        let (send_wakers, wakers_rx) = futures::channel::mpsc::channel(1);
+        wakers: ChannelWakers,
+    ) -> Result<(Self, DropListener), Error> {
         let (inner, drop_listener) = libp2p_webrtc_utils::Stream::new(PollDataChannel::new(
             channel_id,
             rtc,
-            send_wakers,
+            wakers,
             tx_state_inquiry,
         )?);
 
@@ -55,7 +48,6 @@ impl Stream {
                 inner, // : SendWrapper::new(inner),
             },
             drop_listener,
-            wakers_rx,
         ))
     }
 }

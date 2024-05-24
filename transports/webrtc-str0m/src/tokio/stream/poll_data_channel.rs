@@ -55,18 +55,12 @@ impl PollDataChannel {
     pub(crate) fn new(
         channel_id: ChannelId,
         rtc: Arc<Mutex<Rtc>>,
-        send_wakers: futures::channel::mpsc::Sender<ChannelWakers>,
+        wakers: ChannelWakers,
         tx_state_inquiry: mpsc::Sender<Inquiry>,
     ) -> Result<Self, Error> {
         // We purposely don't use `with_capacity` so we don't eagerly allocate `MAX_READ_BUFFER` per stream.
         let read_buffer = Arc::new(Mutex::new(BytesMut::new()));
         let overloaded = Arc::new(AtomicBool::new(false));
-
-        // Send Wakers to Connection struct for triggering by the Event loop.
-        let wakers = ChannelWakers::default();
-        if let Err(e) = send_wakers.clone().try_send(wakers.clone()) {
-            tracing::error!("Failed to send wakers to Connection: {:?}", e);
-        }
 
         Ok(Self {
             channel_id,

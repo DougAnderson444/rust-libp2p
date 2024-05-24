@@ -1,9 +1,8 @@
 //! Upgrades new connections with Noise Protocol.
 
-use crate::tokio::channel::RtcDataChannelState;
 use crate::tokio::connection::OpenConfig;
 use crate::tokio::{
-    connection::{Connectable, Connection, HandshakeState, Opening, OpeningEvent},
+    connection::{Connection, HandshakeState, OpeningEvent},
     error::Error,
     udp_manager::UDPManager,
 };
@@ -22,7 +21,7 @@ use str0m::{
 use str0m::{net::Protocol as Str0mProtocol, Candidate};
 use tokio::sync::Mutex as AsyncMutex;
 
-use super::{connection::Open, fingerprint, stream::Stream};
+use super::{connection::Open, fingerprint};
 
 /// The log target for this module.
 const LOG_TARGET: &str = "libp2p_webrtc_str0m";
@@ -37,7 +36,7 @@ pub(crate) async fn inbound(
     id_keys: identity::Keypair,
     contents: Vec<u8>,
 ) -> Result<(PeerId, Arc<AsyncMutex<Connection<Open>>>), Error> {
-    tracing::debug!(address=%source, ufrag=%remote_ufrag, "new inbound connection from address");
+    tracing::debug!(target: LOG_TARGET, address=%source, ufrag=%remote_ufrag, "new inbound connection from address");
 
     let destination = udp_manager.lock().unwrap().socket().local_addr()?;
     let contents: DatagramRecv = contents.as_slice().try_into()?;
@@ -62,7 +61,8 @@ pub(crate) async fn inbound(
     udp_manager
         .lock()
         .unwrap()
-        .add_connection(source, connection.clone());
+        .addr_conns
+        .insert(source, connection.clone());
 
     // Cast the datagram into a str0m::Receive and pass it to the str0m client
     rtc.lock()
@@ -93,7 +93,12 @@ pub(crate) async fn inbound(
             OpeningEvent::None => {
                 continue;
             }
-            // Timeout, Closed, or Established
+            // Timeout, track them to revisit
+            OpeningEvent::Timeout { timeout } => {
+                tracing::debug!(target: LOG_TARGET, "opening connection upgrade timed out: {:?}", timeout);
+                continue;
+            }
+            // Closed, or Established
             val => {
                 break val;
             }

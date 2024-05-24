@@ -119,30 +119,6 @@ impl Connectable for Opening {
         self.handshake_state.clone()
     }
 
-    fn on_output_transmit(
-        &mut self,
-        socket: Arc<UdpSocket>,
-        transmit: str0m::net::Transmit,
-    ) -> Self::Output {
-        tracing::trace!(
-            target: LOG_TARGET,
-            "transmit opening data",
-        );
-
-        // socket().try_send_to
-        if let Err(error) = socket.try_send_to(&transmit.contents, transmit.destination) {
-            tracing::warn!(
-                target: LOG_TARGET,
-                ?error,
-                "failed to send connection<opening> datagram",
-            );
-
-            // return WebRtcEvent::ConnectionClosed; // Should we assume this?
-        }
-
-        OpeningEvent::None
-    }
-
     /// Handle error for Opening connection.
     fn on_rtc_error(&mut self, error: str0m::RtcError) -> Self::Output {
         tracing::error!(
@@ -186,20 +162,8 @@ impl Connectable for Opening {
     }
 
     /// Progress the opening of the channel, as applicable.
-    fn on_event_channel_open(&mut self, channel_id: ChannelId, name: String) -> Self::Output {
+    fn on_event_channel_open(&mut self, _channel_id: ChannelId, _name: String) -> Self::Output {
         // No Opening specific logic for channel open
-
-        OpeningEvent::None
-    }
-
-    /// When Opening, ChannelData should be the Noise Handshake,
-    /// so data needs to be passed to the PollDataChannel AsyncRead/Write so the
-    /// Noise Protocol has it during `upgrade::inbound` or `upgrade::outbound`
-    fn on_event_channel_data(&mut self, _data: ChannelData) -> Self::Output {
-        tracing::trace!(
-            target: LOG_TARGET,
-            "(noise protocol?) data received over channel",
-        );
 
         OpeningEvent::None
     }
