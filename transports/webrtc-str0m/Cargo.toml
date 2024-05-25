@@ -1,6 +1,6 @@
 [package]
 name = "libp2p-webrtc-str0m"
-version = "0.8.1-alpha"
+version = "0.1.0-alpha"
 authors = ["Doug Anderson <doug@peerpiper.io>"]
 description = "A str0m based WebRTC transport for libp2p"
 repository = "https://github.com/libp2p/rust-libp2p"
@@ -27,7 +27,7 @@ send_wrapper = "0.6.0"
 socket2 = { version = "0.5.5", features = ["all"] }
 str0m = "0.5.1"
 thiserror = "1"
-tokio = { workspace = true, features = ["net", "macros"], optional = true }
+tokio = { workspace = true, features = ["net", "macros", "time"], optional = true }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 
 [features]

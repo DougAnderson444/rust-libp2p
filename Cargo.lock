@@ -3541,7 +3541,7 @@ dependencies = [
 
 [[package]]
 name = "libp2p-webrtc-str0m"
-version = "0.8.1-alpha"
+version = "0.1.0-alpha"
 dependencies = [
  "futures",
  "if-watch",
