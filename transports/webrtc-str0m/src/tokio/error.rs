@@ -1,6 +1,5 @@
 use libp2p_identity::PeerId;
 use std::io::{self, ErrorKind};
-use std::sync::PoisonError;
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -40,7 +39,7 @@ pub enum Error {
 
     /// Send Error
     #[error("send error: `{0}`")]
-    SendError(#[from] TrySendError<Vec<u8>>),
+    Send(#[from] TrySendError<Vec<u8>>),
 
     /// DTLS certificate error.
     #[error("DTLS certificate error, it is missing or invalid")]
@@ -48,7 +47,7 @@ pub enum Error {
 
     /// Str0m Stun Error
     #[error("WebRTC Network error: `{0}`")]
-    NetError(#[from] str0m::error::NetError),
+    Net(#[from] str0m::error::NetError),
 
     /// Disconnected while Opening
     #[error("disconnected while opening")]

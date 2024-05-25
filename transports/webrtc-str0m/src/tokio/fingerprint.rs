@@ -58,10 +58,6 @@ impl Fingerprint {
     pub fn algorithm(&self) -> String {
         self.0.algorithm()
     }
-
-    pub(crate) fn into_inner(self) -> libp2p_webrtc_utils::Fingerprint {
-        self.0
-    }
 }
 
 impl From<libp2p_webrtc_utils::Fingerprint> for Fingerprint {

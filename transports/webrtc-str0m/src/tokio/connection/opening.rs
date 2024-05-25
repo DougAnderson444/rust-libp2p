@@ -163,7 +163,12 @@ impl Connectable for Opening {
     }
 
     fn on_event_channel_close(&mut self, _channel_id: ChannelId) -> Self::Output {
-        todo!()
+        tracing::warn!(
+            target: LOG_TARGET,
+            // connection_id = ?self.connection_id,
+            "channel closed",
+        );
+        Self::Output::default()
     }
 
     fn on_event_connected(&mut self, rtc: Arc<Mutex<Rtc>>) -> Self::Output {
@@ -205,6 +210,7 @@ impl Connectable for Opening {
     }
 
     fn on_event(&self, event: Event) -> Self::Output {
-        todo!()
+        tracing::trace!(target: LOG_TARGET, ?event, "event");
+        Self::Output::default()
     }
 }
