@@ -84,7 +84,7 @@ impl Connection<Opening> {
             tx_state_update: self.tx_state_update,
             stage: Open::new(OpenConfig {
                 peer_id: config.peer_id,
-                handshake_state: config.handshake_state,
+                remote_fingerprint: config.remote_fingerprint,
             }),
         }
     }
@@ -113,11 +113,6 @@ impl Connection<Opening> {
 
 impl Connectable for Opening {
     type Output = OpeningEvent;
-
-    /// Returns the [`HandshakeState`] of the connection.
-    fn handshake_state(&self) -> HandshakeState {
-        self.handshake_state.clone()
-    }
 
     /// Handle error for Opening connection.
     fn on_rtc_error(&mut self, error: str0m::RtcError) -> Self::Output {

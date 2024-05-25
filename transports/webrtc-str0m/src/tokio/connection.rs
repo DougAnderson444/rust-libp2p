@@ -58,9 +58,6 @@ pub trait Connectable {
         Default::default()
     }
 
-    /// Returns the [`HandshakeState`] of the connection.
-    fn handshake_state(&self) -> HandshakeState;
-
     /// Handle Rtc Errors
     fn on_rtc_error(&mut self, error: str0m::RtcError) -> Self::Output;
 

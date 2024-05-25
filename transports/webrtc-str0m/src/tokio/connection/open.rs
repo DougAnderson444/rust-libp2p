@@ -7,8 +7,8 @@ use super::*;
 pub struct Open {
     /// Remote peer ID.
     peer: PeerId,
-    /// The state of the opening connection handshake
-    handshake_state: HandshakeState,
+    /// The remote fingerprint
+    remote_fingerprint: Fingerprint,
 }
 
 impl Open {
@@ -17,7 +17,7 @@ impl Open {
         // An ondatachannel Future enables us to poll for incoming data channel events in StreamMuxer::poll_inbound
         Self {
             peer: config.peer_id,
-            handshake_state: config.handshake_state,
+            remote_fingerprint: config.remote_fingerprint,
         }
     }
 }
@@ -27,19 +27,14 @@ impl Open {
 pub struct OpenConfig {
     /// Remote peer ID.
     pub peer_id: PeerId,
-    /// The state of the opening connection handshake
-    pub handshake_state: HandshakeState,
+    /// The Remote fingerprint
+    pub remote_fingerprint: Fingerprint,
 }
 
 /// Impl Connectable for Open
 impl Connectable for Open {
     /// When Connection is Open, the only output is [str0m::Output::Timeout] ( [Instant] ).
     type Output = Option<std::time::Instant>;
-
-    /// Returns the [`HandshakeState`] of the connection.
-    fn handshake_state(&self) -> HandshakeState {
-        self.handshake_state.clone()
-    }
 
     /// Return [WebRtcEvent::ConnectionClosed] when an error occurs.
     fn on_rtc_error(&mut self, error: str0m::RtcError) -> Self::Output {
@@ -105,7 +100,7 @@ impl Connection<Open> {
     pub async fn run(&mut self) {
         tracing::trace!(
             target: LOG_TARGET,
-            // peer = ?self.peer, // TODO: Move peer to connection?
+            peer = ?self.stage.peer, // TODO: Move peer to connection?
             "start webrtc connection event loop",
         );
         loop {

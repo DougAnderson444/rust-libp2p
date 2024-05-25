@@ -45,6 +45,7 @@ pub(crate) async fn inbound(
     let (rtc, noise_channel_id) =
         make_rtc_client(&remote_ufrag, &remote_ufrag, source, destination, dtls_cert);
 
+    // New Opening Connection
     let mut connection = Connection::new(rtc.clone(), udp_manager.lock().unwrap().socket(), source);
 
     let noise_stream = connection
@@ -65,23 +66,16 @@ pub(crate) async fn inbound(
         ))?;
 
     // Poll the connection to make progress towards an OpeningEvent.
-    // For Opening, we only care about
-    // 1) Timeout,
-    // 2) ConnectionClosed,
-    // 3) ConnectionOpened
-    // 4) None
     let event = loop {
         match connection.poll_progress() {
-            // Keep looping
             OpeningEvent::None => {
                 continue;
             }
-            // Timeout, track them to revisit
             OpeningEvent::Timeout { timeout } => {
                 tracing::debug!(target: LOG_TARGET, "opening connection upgrade timed out: {:?}", timeout);
                 continue;
             }
-            // Closed, or Established
+            // Opened or Closed
             val => {
                 break val;
             }
@@ -104,11 +98,9 @@ pub(crate) async fn inbound(
     .await
     .map_err(|_| Error::NoiseHandshakeFailed)?;
 
-    let handshake_state = HandshakeState::Opened { remote_fingerprint };
-
     let connection = Arc::new(AsyncMutex::new(connection.open(OpenConfig {
         peer_id,
-        handshake_state,
+        remote_fingerprint,
     })));
 
     let connection_clone = Arc::clone(&connection);
