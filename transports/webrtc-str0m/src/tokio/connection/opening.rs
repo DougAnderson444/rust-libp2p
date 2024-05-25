@@ -84,7 +84,6 @@ impl Connection<Opening> {
             tx_state_update: self.tx_state_update,
             stage: Open::new(OpenConfig {
                 peer_id: config.peer_id,
-                remote_fingerprint: config.remote_fingerprint,
             }),
         }
     }
@@ -186,9 +185,7 @@ impl Connectable for Opening {
                     "connection opened",
                 );
 
-                self.handshake_state = HandshakeState::Opened {
-                    remote_fingerprint: remote_fp,
-                };
+                self.handshake_state = HandshakeState::Opened;
 
                 OpeningEvent::ConnectionOpened {
                     remote_fingerprint: remote_fp,

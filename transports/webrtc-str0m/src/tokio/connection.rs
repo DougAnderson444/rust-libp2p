@@ -32,7 +32,7 @@ use std::{
     time::Instant,
 };
 use str0m::{
-    channel::{ChannelData, ChannelId},
+    channel::ChannelId,
     net::{Protocol as Str0mProtocol, Receive},
     Event, IceConnectionState, Input, Output, Rtc,
 };
@@ -107,7 +107,7 @@ impl Default for OpeningEvent {
 
 /// Opening Connection state.
 #[derive(Debug, Clone)]
-pub enum HandshakeState {
+pub(crate) enum HandshakeState {
     /// Connection is poisoned.
     Poisoned,
 
@@ -115,28 +115,10 @@ pub enum HandshakeState {
     Closed,
 
     /// Connection has been opened.
-    Opened {
-        // /// Noise context.
-        // context: NoiseContext,
-        remote_fingerprint: Fingerprint,
-    },
-
-    /// Local Noise handshake has been sent to peer and the connection
-    /// is waiting for an answer.
-    HandshakeSent {
-        // /// Noise context.
-        // context: NoiseContext,
-    },
-
-    /// Response to local Noise handshake has been received and the connection
-    /// is being validated by `TransportManager`.
-    Validating {
-        // /// Noise context.
-        // context: NoiseContext,
-    },
+    Opened,
 }
 
-/// Peer Address
+/// The Socket Address of the remote peer.
 #[derive(Debug)]
 pub(crate) struct PeerAddress(pub(crate) SocketAddr);
 

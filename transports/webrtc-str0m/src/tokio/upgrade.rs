@@ -98,10 +98,7 @@ pub(crate) async fn inbound(
     .await
     .map_err(|_| Error::NoiseHandshakeFailed)?;
 
-    let connection = Arc::new(AsyncMutex::new(connection.open(OpenConfig {
-        peer_id,
-        remote_fingerprint,
-    })));
+    let connection = Arc::new(AsyncMutex::new(connection.open(OpenConfig { peer_id })));
 
     let connection_clone = Arc::clone(&connection);
 

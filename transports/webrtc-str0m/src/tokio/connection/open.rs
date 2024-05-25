@@ -7,8 +7,6 @@ use super::*;
 pub struct Open {
     /// Remote peer ID.
     peer: PeerId,
-    /// The remote fingerprint
-    remote_fingerprint: Fingerprint,
 }
 
 impl Open {
@@ -17,7 +15,6 @@ impl Open {
         // An ondatachannel Future enables us to poll for incoming data channel events in StreamMuxer::poll_inbound
         Self {
             peer: config.peer_id,
-            remote_fingerprint: config.remote_fingerprint,
         }
     }
 }
@@ -27,8 +24,6 @@ impl Open {
 pub struct OpenConfig {
     /// Remote peer ID.
     pub peer_id: PeerId,
-    /// The Remote fingerprint
-    pub remote_fingerprint: Fingerprint,
 }
 
 /// Impl Connectable for Open
