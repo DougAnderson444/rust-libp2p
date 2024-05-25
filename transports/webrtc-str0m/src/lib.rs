@@ -1,5 +1,6 @@
 //! Implementation of the [`libp2p_core::Transport`] trait for WebRTC protocol without a signaling
 //! server.
+#![feature(async_closure)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 #[cfg(feature = "tokio")]

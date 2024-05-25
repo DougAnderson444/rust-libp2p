@@ -162,7 +162,6 @@ impl Connection<Open> {
                                 self.rtc().lock().unwrap().handle_input(Input::Timeout(Instant::now())).unwrap();
                             }
             }
-            todo!();
         }
     }
 }

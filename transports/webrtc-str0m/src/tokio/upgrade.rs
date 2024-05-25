@@ -45,24 +45,11 @@ pub(crate) async fn inbound(
     let (rtc, noise_channel_id) =
         make_rtc_client(&remote_ufrag, &remote_ufrag, source, destination, dtls_cert);
 
-    let connection = Arc::new(Mutex::new(Connection::new(
-        rtc.clone(),
-        udp_manager.lock().unwrap().socket(),
-        source,
-    )));
+    let mut connection = Connection::new(rtc.clone(), udp_manager.lock().unwrap().socket(), source);
 
     let noise_stream = connection
-        .lock()
-        .unwrap()
         .new_stream_from_data_channel_id(noise_channel_id)
         .map_err(|_| Error::StreamCreationFailed)?;
-
-    // This new Connection needs to be added to udp_manager.addr_conns
-    udp_manager
-        .lock()
-        .unwrap()
-        .addr_conns
-        .insert(source, connection.clone());
 
     // Cast the datagram into a str0m::Receive and pass it to the str0m client
     rtc.lock()
@@ -84,11 +71,7 @@ pub(crate) async fn inbound(
     // 3) ConnectionOpened
     // 4) None
     let event = loop {
-        match connection
-            .lock()
-            .map_err(|_| Error::LockPoisoned)?
-            .poll_progress()
-        {
+        match connection.poll_progress() {
             // Keep looping
             OpeningEvent::None => {
                 continue;
@@ -123,9 +106,6 @@ pub(crate) async fn inbound(
 
     let handshake_state = HandshakeState::Opened { remote_fingerprint };
 
-    let conn_lock = Arc::try_unwrap(connection).map_err(|_| Error::LockPoisoned)?;
-    let connection = conn_lock.into_inner().expect("Mutex cannot be locked");
-
     let connection = Arc::new(AsyncMutex::new(connection.open(OpenConfig {
         peer_id,
         handshake_state,
@@ -139,6 +119,13 @@ pub(crate) async fn inbound(
         let mut connection = connection_clone.lock().await;
         connection.run().await;
     });
+
+    // This new Open Connection needs to be added to udp_manager.addr_conns
+    udp_manager
+        .lock()
+        .unwrap()
+        .socket_open_conns
+        .insert(source, connection.clone());
 
     Ok((peer_id, connection))
 }

@@ -15,7 +15,11 @@ use std::{
     task::{Context, Poll},
 };
 use str0m::ice::{IceCreds, StunMessage};
-use tokio::{io::ReadBuf, net::UdpSocket, sync::mpsc::Sender};
+use tokio::{
+    io::ReadBuf,
+    net::UdpSocket,
+    sync::{mpsc::Sender, Mutex as AsyncMutex},
+};
 
 /// Logging target for the file.
 const LOG_TARGET: &str = "libp2p_webrtc_str0m";
@@ -70,8 +74,8 @@ pub(crate) struct UDPManager {
     /// The socket listen address.
     listen_addr: SocketAddr,
 
-    /// All the address connections we are tracking.
-    pub(crate) addr_conns: HashMap<SocketAddr, Arc<Mutex<Connection>>>,
+    /// Mapping of socket addresses to Open connections we have.
+    pub(crate) socket_open_conns: HashMap<SocketAddr, Arc<AsyncMutex<Connection<Open>>>>,
 }
 
 /// Whether this is a new connection that should be Polled or not.
@@ -113,7 +117,7 @@ impl UDPManager {
         Ok(Self {
             listen_addr: socket.local_addr()?,
             socket: Arc::new(socket),
-            addr_conns: HashMap::new(),
+            socket_open_conns: HashMap::new(),
         })
     }
 
@@ -181,12 +185,17 @@ impl UDPManager {
         source: SocketAddr,
         buffer: &[u8],
     ) -> Result<NewSource, error::Error> {
-        // 1) If its Open, we have seen this addr before and we send data
-        if let Some(connection) = self.addr_conns.get_mut(&source) {
-            connection
-                .lock()
-                .map_err(|_| Error::LockPoisoned)?
-                .dgram_recv(buffer)?;
+        // If Open Connection exists, send the datagram to Input::Receive
+        if let Some(connection) = self.socket_open_conns.get_mut(&source) {
+            let connection = connection.clone();
+            let buffer = buffer.to_vec();
+            tokio::task::spawn_blocking(async move || {
+                // The reason we this is async via tokio::Mutex is because connection is shared across async threads
+                // for `connection.run()`, so were using tokio::sync::Mutex to lock it there, so we
+                // also use it here, but it needs to be .await, for which we need to be in an async
+                let mut connection = connection.lock().await;
+                connection.dgram_recv(&buffer)
+            });
             return Ok(NewSource::No);
         }
 
