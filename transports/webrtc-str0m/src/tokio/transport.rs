@@ -95,7 +95,35 @@ impl libp2p_core::Transport for Transport {
         &mut self,
         addr: libp2p_core::Multiaddr,
     ) -> Result<Self::Dial, libp2p_core::transport::TransportError<Self::Error>> {
-        todo!()
+        let (sock_addr, remote_fingerprint) = libp2p_webrtc_utils::parse_webrtc_dial_addr(&addr)
+            .ok_or_else(|| TransportError::MultiaddrNotSupported(addr.clone()))?;
+        if sock_addr.port() == 0 || sock_addr.ip().is_unspecified() {
+            return Err(TransportError::MultiaddrNotSupported(addr));
+        }
+
+        let config = self.config.clone();
+        let client_fingerprint = self.config.fingerprint;
+
+        let upd_manager = Arc::new(Mutex::new(
+            UDPManager::with_address(sock_addr)
+                .map_err(|e| TransportError::Other(Error::Disconnected))?,
+        ));
+
+        let fut = async move {
+            let (peer_id, connection) = upgrade::outbound(
+                sock_addr,
+                config.inner.clone(),
+                upd_manager.clone(),
+                config.inner.dtls_cert().unwrap().clone(),
+                remote_fingerprint,
+                config.id_keys.clone(),
+            )
+            .await?;
+
+            Ok((peer_id, connection))
+        };
+
+        Ok(fut.boxed())
     }
 
     fn dial_as_listener(

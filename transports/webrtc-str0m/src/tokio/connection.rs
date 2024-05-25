@@ -553,6 +553,7 @@ impl StreamMuxer for Connection<Open> {
         self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
+        // create regular data channel, then create stream from channel_id
         todo!()
     }
 
