@@ -6,17 +6,9 @@ use super::*;
 #[derive(Debug)]
 pub struct Open {
     /// Remote peer ID.
-    peer: PeerId,
-}
-
-impl Open {
-    /// Creates a new `Open` state.
-    pub fn new(config: OpenConfig) -> Self {
-        // An ondatachannel Future enables us to poll for incoming data channel events in StreamMuxer::poll_inbound
-        Self {
-            peer: config.peer_id,
-        }
-    }
+    pub(crate) peer: PeerId,
+    /// RX channel for receiving datagrams from the transport.
+    pub(crate) dgram_rx: Receiver<Vec<u8>>,
 }
 
 /// Configure the Open stage:
@@ -80,7 +72,7 @@ impl Connectable for Open {
 /// Implementations that apply only to the Open Connection state.
 impl Connection<Open> {
     /// Connection to peer has been closed.
-    async fn on_connection_closed(&mut self) {
+    fn on_connection_closed(&mut self) {
         tracing::trace!(
             target: LOG_TARGET,
             peer = ?self.stage.peer,
@@ -106,7 +98,7 @@ impl Connection<Open> {
                     peer = ?self.stage.peer,
                     "connection closed",
                 );
-                return self.on_connection_closed().await;
+                return self.on_connection_closed();
             };
 
             let duration = timeout - Instant::now();
@@ -122,7 +114,7 @@ impl Connection<Open> {
             // Do something
             tokio::select! {
                             biased;
-                            datagram = self.dgram_rx.recv() => match datagram {
+                            datagram = self.stage.dgram_rx.recv() => match datagram {
                                 Some(datagram) => {
                                     let input = Input::Receive(
                                         Instant::now(),
@@ -145,7 +137,7 @@ impl Connection<Open> {
                                         peer = ?self.stage.peer,
                                         "read `None` from `dgram_rx`",
                                     );
-                                    return self.on_connection_closed().await;
+                                    return self.on_connection_closed();
                                 }
                             },
                             _ = tokio::time::sleep(duration) => {

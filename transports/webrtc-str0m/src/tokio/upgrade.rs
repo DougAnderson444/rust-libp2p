@@ -98,7 +98,9 @@ pub(crate) async fn inbound(
     .await
     .map_err(|_| Error::NoiseHandshakeFailed)?;
 
-    let connection = Arc::new(AsyncMutex::new(connection.open(OpenConfig { peer_id })));
+    let (connection, relay_dgram) = connection.open(OpenConfig { peer_id });
+
+    let connection = Arc::new(AsyncMutex::new(connection));
 
     let connection_clone = Arc::clone(&connection);
 
@@ -109,12 +111,12 @@ pub(crate) async fn inbound(
         connection.run().await;
     });
 
-    // This new Open Connection needs to be added to udp_manager.addr_conns
+    // A relay tp this new Open Connection needs to be added to udp_manager
     udp_manager
         .lock()
         .unwrap()
         .socket_open_conns
-        .insert(source, connection.clone());
+        .insert(source, relay_dgram);
 
     Ok((peer_id, connection))
 }
@@ -174,7 +176,9 @@ pub(crate) async fn outbound(
     .await
     .map_err(|_| Error::NoiseHandshakeFailed)?;
 
-    let connection = Arc::new(AsyncMutex::new(connection.open(OpenConfig { peer_id })));
+    let (connection, relay_dgram) = connection.open(OpenConfig { peer_id });
+
+    let connection = Arc::new(AsyncMutex::new(connection));
 
     let connection_clone = Arc::clone(&connection);
 
@@ -190,7 +194,7 @@ pub(crate) async fn outbound(
         .lock()
         .unwrap()
         .socket_open_conns
-        .insert(source, connection.clone());
+        .insert(source, relay_dgram);
 
     Ok((peer_id, connection))
 }

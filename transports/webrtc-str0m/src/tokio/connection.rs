@@ -38,6 +38,7 @@ use str0m::{
 };
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::{self, Receiver};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::tokio::Error;
 
@@ -147,12 +148,6 @@ pub struct Connection<Stage = Opening> {
     /// Rtc object associated with the connection.
     rtc: Arc<Mutex<Rtc>>,
 
-    /// TX channel for passing along received datagrams by relaying them to the connection event handler.
-    relay_dgram: Sender<Vec<u8>>,
-
-    /// RX channel for receiving datagrams from the transport.
-    dgram_rx: Receiver<Vec<u8>>,
-
     /// Peer address Newtype
     peer_address: PeerAddress,
 
@@ -187,14 +182,6 @@ impl<Stage> Unpin for Connection<Stage> {}
 
 /// Implementations that apply to both [Stages].
 impl<Stage: Connectable> Connection<Stage> {
-    /// Receive a datagram from the socket and process it according to the stage of the connection.
-    pub fn dgram_recv(&mut self, buf: &[u8]) -> Result<(), Error> {
-        // use Open or Opening depending on the state
-        self.relay_dgram
-            .try_send(buf.to_vec())
-            .map_err(|_| Error::Disconnected)
-    }
-
     /// Report the connection as closed.
     pub fn report_connection_closed(&self) {
         todo!()
@@ -527,7 +514,7 @@ pub(crate) fn state_loop(
 }
 /// WebRTC native multiplexing of [Open] [Connection]s.
 /// Allow users to open their substreams
-impl StreamMuxer for Connection<Open> {
+impl StreamMuxer for Connection {
     type Substream = Stream;
     type Error = Error;
 

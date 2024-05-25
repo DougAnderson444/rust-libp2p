@@ -33,8 +33,6 @@ impl Opening {
 impl Connection<Opening> {
     /// Creates a new `Connection` in the Opening state.
     pub fn new(rtc: Arc<Mutex<Rtc>>, socket: Arc<UdpSocket>, source: SocketAddr) -> Self {
-        // Create a channel for sending datagrams to the connection event handler.
-        let (relay_dgram, dgram_rx) = mpsc::channel(DATAGRAM_BUFFER_SIZE);
         let (tx_ondatachannel, rx_ondatachannel) = futures::channel::mpsc::channel(4);
 
         let local_address = socket.local_addr().unwrap();
@@ -50,8 +48,6 @@ impl Connection<Opening> {
             rtc,
             socket,
             stage: Opening::new(),
-            relay_dgram,
-            dgram_rx,
             peer_address: PeerAddress(source),
             local_address,
             tx_ondatachannel,
@@ -67,25 +63,30 @@ impl Connection<Opening> {
     /// Completes the connection opening process.
     /// The only way to get to Open is to go throguh Opening.
     /// Openin> to Open moves values into the Open state.
-    pub fn open(self, config: OpenConfig) -> Connection<Open> {
-        Connection {
-            rtc: self.rtc,
-            channel_details: self.channel_details,
-            relay_dgram: self.relay_dgram,
-            dgram_rx: self.dgram_rx,
-            peer_address: self.peer_address,
-            local_address: self.local_address,
-            socket: self.socket,
-            tx_ondatachannel: self.tx_ondatachannel,
-            rx_ondatachannel: self.rx_ondatachannel,
-            no_drop_listeners_waker: self.no_drop_listeners_waker,
-            drop_listeners: self.drop_listeners,
-            tx_state_inquiry: self.tx_state_inquiry,
-            tx_state_update: self.tx_state_update,
-            stage: Open::new(OpenConfig {
-                peer_id: config.peer_id,
-            }),
-        }
+    pub fn open(self, config: OpenConfig) -> (Connection<Open>, Sender<Vec<u8>>) {
+        // Create a channel for sending datagrams to the connection event handler.
+        let (relay_dgram, dgram_rx) = mpsc::channel(DATAGRAM_BUFFER_SIZE);
+
+        (
+            Connection {
+                rtc: self.rtc,
+                channel_details: self.channel_details,
+                peer_address: self.peer_address,
+                local_address: self.local_address,
+                socket: self.socket,
+                tx_ondatachannel: self.tx_ondatachannel,
+                rx_ondatachannel: self.rx_ondatachannel,
+                no_drop_listeners_waker: self.no_drop_listeners_waker,
+                drop_listeners: self.drop_listeners,
+                tx_state_inquiry: self.tx_state_inquiry,
+                tx_state_update: self.tx_state_update,
+                stage: Open {
+                    peer: config.peer_id,
+                    dgram_rx,
+                },
+            },
+            relay_dgram,
+        )
     }
 
     /// Handle timeout

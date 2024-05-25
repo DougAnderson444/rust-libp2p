@@ -75,7 +75,7 @@ pub(crate) struct UDPManager {
     listen_addr: SocketAddr,
 
     /// Mapping of socket addresses to Open connections we have.
-    pub(crate) socket_open_conns: HashMap<SocketAddr, Arc<AsyncMutex<Connection<Open>>>>,
+    pub(crate) socket_open_conns: HashMap<SocketAddr, Sender<Vec<u8>>>,
 }
 
 /// Whether this is a new connection that should be Polled or not.
@@ -186,16 +186,10 @@ impl UDPManager {
         buffer: &[u8],
     ) -> Result<NewSource, error::Error> {
         // If Open Connection exists, send the datagram to Input::Receive
-        if let Some(connection) = self.socket_open_conns.get_mut(&source) {
-            let connection = connection.clone();
-            let buffer = buffer.to_vec();
-            tokio::task::spawn_blocking(async move || {
-                // The reason we this is async via tokio::Mutex is because connection is shared across async threads
-                // for `connection.run()`, so were using tokio::sync::Mutex to lock it there, so we
-                // also use it here, but it needs to be .await, for which we need to be in an async
-                let mut connection = connection.lock().await;
-                connection.dgram_recv(&buffer)
-            });
+        if let Some(sender) = self.socket_open_conns.get_mut(&source) {
+            sender
+                .try_send(buffer.to_vec())
+                .map_err(|_| Error::Disconnected)?;
             return Ok(NewSource::No);
         }
 
