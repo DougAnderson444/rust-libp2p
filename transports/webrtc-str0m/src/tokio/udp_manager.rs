@@ -181,9 +181,7 @@ impl UDPManager {
         source: SocketAddr,
         buffer: &[u8],
     ) -> Result<NewSource, error::Error> {
-        // 1) If its Open or Opening, we have seen this addr before and we send data
-        // There should be a connection_event_handler running already to receive this data,
-        // which if there is a connection, will be true.
+        // 1) If its Open, we have seen this addr before and we send data
         if let Some(connection) = self.addr_conns.get_mut(&source) {
             connection
                 .lock()
