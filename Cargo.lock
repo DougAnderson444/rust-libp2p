@@ -793,7 +793,7 @@ dependencies = [
  "futures",
  "js-sys",
  "libp2p",
- "libp2p-webrtc",
+ "libp2p-webrtc-str0m",
  "libp2p-webrtc-websys",
  "mime_guess",
  "rand 0.8.5",
