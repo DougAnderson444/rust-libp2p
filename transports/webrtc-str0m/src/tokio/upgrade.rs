@@ -35,7 +35,7 @@ pub(crate) async fn inbound(
     remote_ufrag: String,
     id_keys: identity::Keypair,
     contents: Vec<u8>,
-) -> Result<(PeerId, Arc<AsyncMutex<Connection<Open>>>), Error> {
+) -> Result<(PeerId, Connection<Open>), Error> {
     tracing::debug!(target: LOG_TARGET, address=%source, ufrag=%remote_ufrag, "new inbound connection from address");
 
     let destination = udp_manager.lock().unwrap().socket().local_addr()?;
@@ -100,16 +100,16 @@ pub(crate) async fn inbound(
 
     let (connection, relay_dgram) = connection.open(OpenConfig { peer_id });
 
-    let connection = Arc::new(AsyncMutex::new(connection));
-
-    let connection_clone = Arc::clone(&connection);
+    // let connection = Arc::new(AsyncMutex::new(connection));
+    //
+    // let connection_clone = Arc::clone(&connection);
 
     // now that the connection is opened, we need to spawn an ongoing loop
     // for the connection events to be handled in an ongoing manner
-    tokio::spawn(async move {
-        let mut connection = connection_clone.lock().await;
-        connection.run().await;
-    });
+    // tokio::spawn(async move {
+    //     let mut connection = connection_clone.lock().await;
+    //     connection.run().await;
+    // });
 
     // A relay tp this new Open Connection needs to be added to udp_manager
     udp_manager
@@ -129,7 +129,7 @@ pub(crate) async fn outbound(
     dtls_cert: DtlsCert,
     remote_fingerprint: Fingerprint,
     id_keys: identity::Keypair,
-) -> Result<(PeerId, Arc<AsyncMutex<Connection<Open>>>), Error> {
+) -> Result<(PeerId, Connection<Open>), Error> {
     tracing::debug!(target: LOG_TARGET, address=%destination, "new outbound connection to address");
 
     let source = udp_manager.lock().unwrap().socket().local_addr()?;
@@ -178,16 +178,16 @@ pub(crate) async fn outbound(
 
     let (connection, relay_dgram) = connection.open(OpenConfig { peer_id });
 
-    let connection = Arc::new(AsyncMutex::new(connection));
-
-    let connection_clone = Arc::clone(&connection);
+    // let connection = Arc::new(AsyncMutex::new(connection));
+    //
+    // let connection_clone = Arc::clone(&connection);
 
     // now that the connection is opened, we need to spawn an ongoing loop
     // for the connection events to be handled in an ongoing manner
-    tokio::spawn(async move {
-        let mut connection = connection_clone.lock().await;
-        connection.run().await;
-    });
+    // tokio::spawn(async move {
+    //     let mut connection = connection_clone.lock().await;
+    //     connection.run().await;
+    // });
 
     // This new Open Connection needs to be added to udp_manager.addr_conns
     udp_manager

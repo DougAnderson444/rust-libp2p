@@ -16,12 +16,14 @@ use crate::tokio::channel::{InquiryType, StateValues};
 use crate::tokio::fingerprint::Fingerprint;
 use crate::tokio::UdpSocket;
 
+use futures::prelude::*;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
 use libp2p_identity::PeerId;
 use std::borrow::BorrowMut;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::MutexGuard;
 use std::task::{ready, Context, Poll, Waker};
 use std::{
@@ -38,11 +40,12 @@ use str0m::{
 };
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::{self, Receiver};
-use tokio::sync::Mutex as AsyncMutex;
 
 use crate::tokio::Error;
 
-use super::channel::{ChannelDetails, ChannelWakers, Inquiry, RtcDataChannelState, StateUpdate};
+use super::channel::{
+    ChannelDetails, ChannelWakers, Inquiry, NewDataChannel, RtcDataChannelState, StateUpdate,
+};
 use super::stream::{DropListener, Stream};
 
 /// The size of the buffer for incoming datagrams.
@@ -120,7 +123,7 @@ pub(crate) enum HandshakeState {
 }
 
 /// The Socket Address of the remote peer.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PeerAddress(pub(crate) SocketAddr);
 
 /// PeerAddress is a smart pointer, this gets the inner value easily:
@@ -143,7 +146,7 @@ pub struct Connection<Stage = Opening> {
     socket: Arc<UdpSocket>,
 
     /// Channel details by channel_id, such as wakers, data receivers, and state change receivers.
-    channel_details: HashMap<ChannelId, Mutex<ChannelDetails>>,
+    channel_details: HashMap<ChannelId, Arc<Mutex<ChannelDetails>>>,
 
     /// Rtc object associated with the connection.
     rtc: Arc<Mutex<Rtc>>,
@@ -153,12 +156,6 @@ pub struct Connection<Stage = Opening> {
 
     /// This peer's local address.
     local_address: SocketAddr,
-
-    /// Inbound Data Channels, a future that notifies the StreamMuxer that there are incoming channels ready
-    pub(crate) rx_ondatachannel: futures::channel::mpsc::Receiver<ChannelId>,
-
-    /// Transmitter to notify StreamMuxer that there is a new channel opened
-    tx_ondatachannel: futures::channel::mpsc::Sender<ChannelId>,
 
     /// A list of futures, which, once completed, signal that a [`Stream`] has been dropped.
     drop_listeners: FuturesUnordered<DropListener>,
@@ -273,15 +270,6 @@ impl<Stage: Connectable> Connection<Stage> {
                                 channel_id,
                                 e
                             );
-                        }
-
-                        // notify StreamMuxer using tx_ondatachannel
-                        if let Err(e) = self
-                            .tx_ondatachannel
-                            .try_send(channel_id)
-                            .map_err(|_| Error::Disconnected)
-                        {
-                            tracing::error!("Failed to send channel_id to StreamMuxer: {:?}", e);
                         }
 
                         // shake open waker to prompt PollDataChannel to re-poll
@@ -417,11 +405,11 @@ impl<Stage> Connection<Stage> {
 
         self.channel_details.insert(
             channel_id,
-            Mutex::new(ChannelDetails {
+            Arc::new(Mutex::new(ChannelDetails {
                 state: RtcDataChannelState::Opening,
                 wakers,
                 read_buffer: Default::default(),
-            }),
+            })),
         );
 
         // TODO: Verify that noise channels are dropped correctly from this list
@@ -443,18 +431,43 @@ pub(crate) fn state_loop(
 ) {
     tokio::spawn(async move {
         let mut channel_details: HashMap<ChannelId, RefCell<ChannelDetails>> = HashMap::new();
+        // A list of new channels that have been opened that have not yet been polled into streams
+        // by poll_inbound.
+        let mut new_channels: HashSet<ChannelId> = HashSet::new();
         loop {
             tokio::select! {
                 Some(update) = rx_state_update.recv() => {
                     // Update the state of the channel
-                    let mut channel_details = channel_details.get(&update.channel_id).expect("ChannelDetails should be present in the Connection struct for the channel_id").borrow_mut();
                     match update.state {
                         StateValues::RtcState(state) => {
-                            channel_details.state = state;
+                            match channel_details.get(&update.channel_id) {
+                                None => {
+                                    if state == RtcDataChannelState::Open {
+                                        channel_details.insert(update.channel_id, RefCell::new(ChannelDetails {
+                                            state: RtcDataChannelState::Opening,
+                                            wakers: ChannelWakers::default(),
+                                            read_buffer: Default::default(),
+                                        }));
+                                        // Add to new_channels
+                                        new_channels.insert(update.channel_id);
+                                    }
+                                }
+                                Some(d) => {
+                                    d.borrow_mut().state = state;
+                                }
+                            }
                         }
                         StateValues::ReadBuffer(data) => {
-                            let mut read_buffer = channel_details.read_buffer.lock().unwrap();
-                            read_buffer.extend_from_slice(&data);
+                            match channel_details.get(&update.channel_id) {
+                                None => {
+                                    tracing::error!("No channel details for channel_id: {:?}", update.channel_id);
+                                }
+                                Some(channel_details) => {
+                                    let channel_details = channel_details.borrow();
+                                    let mut read_buffer = channel_details.read_buffer.lock().unwrap();
+                                    read_buffer.extend_from_slice(&data);
+                                }
+                            }
                         }
                     }
                 }
@@ -464,7 +477,7 @@ pub(crate) fn state_loop(
                     // the ty.
                     match inquiry.ty {
                         InquiryType::State(state_inquiry) => {
-                            match channel_details.get(&inquiry.channel_id) {
+                            match channel_details.get(&inquiry.channel_id.unwrap()) {
                                 None => {
                                     if let Err(err) = state_inquiry.response.send(RtcDataChannelState::Closed) {
                                         tracing::error!("Failed to send state inquiry response: {:?}", err);
@@ -480,7 +493,7 @@ pub(crate) fn state_loop(
                                         Ok(_) => {
                                             if borrowed_details.state == RtcDataChannelState::Closed {
                                                 drop(borrowed_details);
-                                                channel_details.borrow_mut().remove(&inquiry.channel_id);
+                                                channel_details.borrow_mut().remove(&inquiry.channel_id.unwrap());
                                             }
                                         }
                                     }
@@ -488,7 +501,7 @@ pub(crate) fn state_loop(
                             }
                         }
                         InquiryType::ReadBuffer(read_inquiry) => {
-                            match channel_details.get(&inquiry.channel_id) {
+                            match channel_details.get(&inquiry.channel_id.unwrap()) {
                                 None => {
                                     if let Err(err) = read_inquiry.response.send(Vec::new()) {
                                         tracing::error!("Failed to send read inquiry response: {:?}", err);
@@ -506,6 +519,14 @@ pub(crate) fn state_loop(
                                 }
                             }
                         }
+                        InquiryType::NewDataChannel(ndc) => {
+                            // send a channel from new_channels
+                            if let Some(channel_id) = new_channels.iter().next() {
+                                if let Err(err) = ndc.response.send(*channel_id) {
+                                    tracing::error!("Failed to send new data channel: {:?}", err);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -514,7 +535,7 @@ pub(crate) fn state_loop(
 }
 /// WebRTC native multiplexing of [Open] [Connection]s.
 /// Allow users to open their substreams
-impl StreamMuxer for Connection {
+impl StreamMuxer for Connection<Open> {
     type Substream = Stream;
     type Error = Error;
 
@@ -522,15 +543,32 @@ impl StreamMuxer for Connection {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+
+        // send inquiry for new data channels
+        if let Err(e) = self
+            .tx_state_inquiry
+            .try_send(Inquiry {
+                channel_id: None,
+                ty: InquiryType::NewDataChannel(NewDataChannel { response: tx }),
+            })
+            .map_err(|_| Error::Disconnected)
+        {
+            tracing::error!("Failed to send inquiry for new data channels: {:?}", e);
+        }
+
         // wait for inbound data channels to be ready
-        match ready!(self.rx_ondatachannel.poll_next_unpin(cx)) {
-            Some(channel_id) => {
+        match ready!(rx.poll_unpin(cx)) {
+            Ok(channel_id) => {
                 let stream = self.new_stream_from_data_channel_id(channel_id)?;
                 Poll::Ready(Ok(stream))
             }
-            None => {
+            Err(err) => {
                 // No more channels to poll
-                tracing::debug!("`Sender` for inbound data channels has been dropped");
+                tracing::debug!(
+                    "`Sender` for inbound data channels has been dropped {:?}",
+                    err
+                );
                 Poll::Ready(Err(Error::Disconnected))
             }
         }

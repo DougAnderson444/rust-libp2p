@@ -82,7 +82,7 @@ impl PollDataChannel {
         let (tx, mut rx) = futures::channel::oneshot::channel();
 
         let state_change = Inquiry {
-            channel_id: self.channel_id,
+            channel_id: Some(self.channel_id),
             ty: InquiryType::ReadBuffer(ReadInquiry {
                 response: tx,
                 max_bytes,
@@ -112,7 +112,7 @@ impl PollDataChannel {
         let (tx, mut rx) = futures::channel::oneshot::channel();
 
         let state_change = Inquiry {
-            channel_id: self.channel_id,
+            channel_id: Some(self.channel_id),
             ty: InquiryType::State(StateInquiry { response: tx }),
         };
 

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use str0m::channel::ChannelId;
 use tokio_util::bytes::BytesMut;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ChannelDetails {
     /// The wakers for this channel_id
     pub(crate) wakers: ChannelWakers,
@@ -31,7 +31,8 @@ pub(crate) struct ChannelWakers {
 #[derive(Debug)]
 pub(crate) struct Inquiry {
     /// The channel id we want to know about
-    pub(crate) channel_id: ChannelId,
+    pub(crate) channel_id: Option<ChannelId>,
+
     /// Inquiry for the read buffer of the DataChannel.
     pub(crate) ty: InquiryType,
 }
@@ -43,6 +44,8 @@ pub(crate) enum InquiryType {
     State(StateInquiry),
     /// Inquiry for the read buffer of the DataChannel.
     ReadBuffer(ReadInquiry),
+    /// New Data Channels
+    NewDataChannel(NewDataChannel),
 }
 /// Encapsulates State changes for the DataChannel sent form the Connection.
 #[derive(Debug)]
@@ -59,6 +62,13 @@ pub(crate) struct ReadInquiry {
     pub(crate) response: futures::channel::oneshot::Sender<Vec<u8>>,
     /// Max Bytes length to read (the size of the buffer we have available)
     pub(crate) max_bytes: usize,
+}
+
+/// Inquiry for new Data Channels
+#[derive(Debug)]
+pub(crate) struct NewDataChannel {
+    /// The new Data Channel
+    pub(crate) response: futures::channel::oneshot::Sender<ChannelId>,
 }
 
 /// Enum for the response of [RequestState] containing the request type and the response value

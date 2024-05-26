@@ -58,7 +58,7 @@ impl Transport {
 }
 
 impl libp2p_core::Transport for Transport {
-    type Output = (PeerId, Arc<AsyncMutex<Connection<Open>>>);
+    type Output = (PeerId, Connection<Open>);
 
     type Error = Error;
 

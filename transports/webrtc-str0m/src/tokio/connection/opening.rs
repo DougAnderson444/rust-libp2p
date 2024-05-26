@@ -33,8 +33,6 @@ impl Opening {
 impl Connection<Opening> {
     /// Creates a new `Connection` in the Opening state.
     pub fn new(rtc: Arc<Mutex<Rtc>>, socket: Arc<UdpSocket>, source: SocketAddr) -> Self {
-        let (tx_ondatachannel, rx_ondatachannel) = futures::channel::mpsc::channel(4);
-
         let local_address = socket.local_addr().unwrap();
 
         // Make the state_inquiry channel
@@ -50,8 +48,6 @@ impl Connection<Opening> {
             stage: Opening::new(),
             peer_address: PeerAddress(source),
             local_address,
-            tx_ondatachannel,
-            rx_ondatachannel,
             drop_listeners: Default::default(),
             no_drop_listeners_waker: Default::default(),
             channel_details: Default::default(),
@@ -74,8 +70,6 @@ impl Connection<Opening> {
                 peer_address: self.peer_address,
                 local_address: self.local_address,
                 socket: self.socket,
-                tx_ondatachannel: self.tx_ondatachannel,
-                rx_ondatachannel: self.rx_ondatachannel,
                 no_drop_listeners_waker: self.no_drop_listeners_waker,
                 drop_listeners: self.drop_listeners,
                 tx_state_inquiry: self.tx_state_inquiry,

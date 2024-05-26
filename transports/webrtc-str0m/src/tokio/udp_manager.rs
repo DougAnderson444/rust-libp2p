@@ -207,11 +207,13 @@ impl UDPManager {
                     pass: pass.to_owned(),
                 }))
             }
-            Err(_not_stun) => {
+            Err(err) => {
                 tracing::warn!(
                     target: LOG_TARGET,
-                    "received non-stun message while opening from source: {}",
+                    "received non-stun message while opening from source: {}, \n\n err: {} \n\n msg: {:?}",
                     source,
+                    err,
+                    String::from_utf8_lossy(buffer)
                 );
                 // TODO: Input::Receive and handle_input? of non-stun?
 
