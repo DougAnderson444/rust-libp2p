@@ -4,6 +4,7 @@ use crate::tokio::{
     connection::{Open, Opening},
     error, Connection, Error,
 };
+use futures::channel::mpsc::{Receiver, Sender};
 use libp2p_core::transport::ListenerId;
 use libp2p_identity::PeerId;
 use socket2::{Domain, Socket, Type};
@@ -18,7 +19,7 @@ use str0m::ice::{IceCreds, StunMessage};
 use tokio::{
     io::ReadBuf,
     net::UdpSocket,
-    sync::{mpsc::Sender, Mutex as AsyncMutex},
+    sync::{mpsc, Mutex as AsyncMutex},
 };
 
 /// Logging target for the file.
@@ -66,6 +67,18 @@ enum ConnectionState {
     Opening(Connection<Opening>),
 }
 
+/// A struct which handles Socket Open Connection process
+/// Initial Sender is a futures mpsc Option which is taken for Initialization,
+/// The second Sender is the regular sender to send datagrams to the Connection
+#[derive(Debug)]
+pub(crate) struct SocketOpenConnection {
+    /// The initial sender to notify the Connection that it's open.
+    pub(crate) notifier: Option<Receiver<mpsc::Sender<Vec<u8>>>>,
+
+    /// The sender to send datagrams to the Connection.
+    pub(crate) sender: Option<mpsc::Sender<Vec<u8>>>,
+}
+
 /// The `UDPManager` struct is responsible for managing the UDP connections used by the WebRTC transport.
 pub(crate) struct UDPManager {
     /// The UDP socket used for sending and receiving data.
@@ -75,7 +88,7 @@ pub(crate) struct UDPManager {
     listen_addr: SocketAddr,
 
     /// Mapping of socket addresses to Open connections we have.
-    pub(crate) socket_open_conns: HashMap<SocketAddr, Sender<Vec<u8>>>,
+    pub(crate) socket_open_conns: HashMap<SocketAddr, SocketOpenConnection>,
 }
 
 /// Whether this is a new connection that should be Polled or not.
@@ -185,12 +198,34 @@ impl UDPManager {
         source: SocketAddr,
         buffer: &[u8],
     ) -> Result<NewSource, error::Error> {
-        // If Open Connection exists, send the datagram to Input::Receive
-        if let Some(sender) = self.socket_open_conns.get_mut(&source) {
-            sender
-                .try_send(buffer.to_vec())
-                .map_err(|_| Error::Disconnected)?;
-            return Ok(NewSource::No);
+        // get the notified from the notifier in open connections
+        if let Some(SocketOpenConnection { notifier, sender }) =
+            self.socket_open_conns.get_mut(&source)
+        {
+            // take the notifier out of the Option, leaving None in it;s place
+            // if is Some, then recv from it before using the sender int he next step
+            if let Some(mut notifier) = notifier.take() {
+                let sndr = notifier.try_next().map_err(|_| Error::Disconnected)?;
+                *sender = sndr;
+            }
+
+            // If Open Connection exists, send the datagram to Input::Receive
+            match sender {
+                Some(sender) => {
+                    sender
+                        .try_send(buffer.to_vec())
+                        .map_err(|_| Error::Disconnected)?;
+                    return Ok(NewSource::No);
+                }
+                None => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        "notifier was None for open connection from source: {}",
+                        source
+                    );
+                    return Err(Error::Disconnected);
+                }
+            }
         }
 
         // 2) Otherwise we haven't seen this source address before, it should be Stun, and we return the ICE creds (ufrag, pass)

@@ -16,6 +16,7 @@ use crate::tokio::channel::{InquiryType, StateValues};
 use crate::tokio::fingerprint::Fingerprint;
 use crate::tokio::UdpSocket;
 
+use futures::channel::mpsc::Sender;
 use futures::prelude::*;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -38,8 +39,7 @@ use str0m::{
     net::{Protocol as Str0mProtocol, Receive},
     Event, IceConnectionState, Input, Output, Rtc,
 };
-use tokio::sync::mpsc::Sender;
-use tokio::sync::mpsc::{self, Receiver};
+use tokio::sync::mpsc;
 
 use crate::tokio::Error;
 
@@ -173,6 +173,10 @@ pub struct Connection<Stage = Opening> {
     /// Receiver for state updates from a [PollDataChannel]. We only need one of these
     /// as this single Connection will be the only one sending updates.
     tx_state_update: mpsc::Sender<StateUpdate>,
+
+    /// Notifies any dgram sender that the Connection is ready to receive datagrams
+    /// Includes a mpsc Sender for the dgram sender to send datagrams to the Connection
+    notify_dgram_senders: Sender<mpsc::Sender<Vec<u8>>>,
 }
 
 impl<Stage> Unpin for Connection<Stage> {}
@@ -426,8 +430,8 @@ impl<Stage> Connection<Stage> {
 /// Spawns a tokio task which listens on the given mpsc receiver for incoming
 /// inquiries about self.state of a channel_id, and responds with the current state.
 pub(crate) fn state_loop(
-    mut rx_state_update: Receiver<StateUpdate>,
-    mut rx_state_inquiry: Receiver<Inquiry>,
+    mut rx_state_update: tokio::sync::mpsc::Receiver<StateUpdate>,
+    mut rx_state_inquiry: tokio::sync::mpsc::Receiver<Inquiry>,
 ) {
     tokio::spawn(async move {
         let mut channel_details: HashMap<ChannelId, RefCell<ChannelDetails>> = HashMap::new();

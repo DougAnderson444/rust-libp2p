@@ -3,12 +3,10 @@
 use super::*;
 
 /// The Open Connection state.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Open {
     /// Remote peer ID.
     pub(crate) peer: PeerId,
-    /// RX channel for receiving datagrams from the transport.
-    pub(crate) dgram_rx: Receiver<Vec<u8>>,
 }
 
 /// Configure the Open stage:
@@ -69,6 +67,20 @@ impl Connectable for Open {
     }
 }
 
+// /// Impl Clone for Connection<Open>
+// impl Clone for Connection<Open> {
+//     fn clone(&self) -> Self {
+//         Self {
+//             rtc: self.rtc.clone(),
+//             stage: self.stage.clone(),
+//             local_address: self.local_address,
+//             peer_address: self.peer_address,
+//             drop_listeners: self.drop_listeners.clone(),
+//             channel_details: self.channel_details.clone(),
+//         }
+//     }
+// }
+
 /// Implementations that apply only to the Open Connection state.
 impl Connection<Open> {
     /// Connection to peer has been closed.
@@ -90,6 +102,11 @@ impl Connection<Open> {
             peer = ?self.stage.peer, // TODO: Move peer to connection?
             "start webrtc connection event loop",
         );
+
+        let (tx_dgram, mut dgram_rx) = mpsc::channel(DATAGRAM_BUFFER_SIZE);
+        // Notify senders that we are ready to rx their dgrams
+        self.notify_dgram_senders.send(tx_dgram);
+
         loop {
             // poll output until we get a timeout
             let Some(timeout) = self.rtc_poll_output() else {
@@ -114,7 +131,7 @@ impl Connection<Open> {
             // Do something
             tokio::select! {
                             biased;
-                            datagram = self.stage.dgram_rx.recv() => match datagram {
+                            datagram = dgram_rx.recv() => match datagram {
                                 Some(datagram) => {
                                     let input = Input::Receive(
                                         Instant::now(),
