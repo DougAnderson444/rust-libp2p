@@ -73,6 +73,9 @@ pub enum Error {
 
     #[error("Opening Connection inut rejected")]
     InputRejected,
+
+    #[error("Failed to receive data")]
+    Receive,
 }
 
 impl Error {

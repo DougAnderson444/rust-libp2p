@@ -7,6 +7,10 @@ use super::*;
 pub struct Open {
     /// Remote peer ID.
     pub(crate) peer_id: PeerId,
+
+    /// Notifies any dgram sender that the Connection is ready to receive datagrams
+    /// Includes a mpsc Sender for the dgram sender to send datagrams to the Connection
+    pub(crate) notify_dgram_senders: Sender<mpsc::Sender<Vec<u8>>>,
 }
 
 /// Impl Connectable for Open
@@ -84,7 +88,7 @@ impl Connection<Open> {
 
         let (tx_dgram, mut dgram_rx) = mpsc::channel(DATAGRAM_BUFFER_SIZE);
         // Notify senders that we are ready to rx their dgrams
-        if let Err(e) = self.notify_dgram_senders.try_send(tx_dgram) {
+        if let Err(e) = self.stage.notify_dgram_senders.try_send(tx_dgram) {
             tracing::error!(
                 target: LOG_TARGET,
                 ?e,

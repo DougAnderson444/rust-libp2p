@@ -34,11 +34,7 @@ impl Opening {
 /// Implementations that apply only to the Opening Connection state.
 impl Connection<Opening> {
     /// Creates a new `Connection` in the Opening state.
-    pub fn new(
-        rtc: Arc<Mutex<Rtc>>,
-        socket: Arc<UdpSocket>,
-        source: SocketAddr,
-    ) -> (Self, Receiver<mpsc::Sender<Vec<u8>>>) {
+    pub fn new(rtc: Arc<Mutex<Rtc>>, socket: Arc<UdpSocket>, source: SocketAddr) -> Self {
         let local_address = socket.local_addr().unwrap();
 
         // Make the state_inquiry channel
@@ -46,41 +42,41 @@ impl Connection<Opening> {
 
         let (tx_state_update, rx_state_update) = mpsc::channel::<StateUpdate>(1);
 
-        let (notify_dgram_senders, dgram_senders) = channel::<mpsc::Sender<Vec<u8>>>(1);
-
         state_loop(rx_state_update, rx_state_inquiry);
 
-        (
-            Self {
-                rtc,
-                socket,
-                stage: Opening::new(),
-                peer_address: PeerAddress(source),
-                local_address,
-                channel_details: Default::default(),
-                tx_state_inquiry,
-                tx_state_update,
-                notify_dgram_senders,
-            },
-            dgram_senders,
-        )
+        Self {
+            rtc,
+            socket,
+            stage: Opening::new(),
+            peer_address: PeerAddress(source),
+            local_address,
+            channel_details: Default::default(),
+            tx_state_inquiry,
+            tx_state_update,
+        }
     }
 
     /// Completes the connection opening process.
     /// The only way to get to Open is to go throguh Opening.
     /// Openin> to Open moves values into the Open state.
-    pub fn open(self, peer_id: PeerId) -> Connection<Open> {
-        Connection {
-            rtc: self.rtc,
-            channel_details: self.channel_details,
-            peer_address: self.peer_address,
-            local_address: self.local_address,
-            socket: self.socket,
-            tx_state_inquiry: self.tx_state_inquiry,
-            tx_state_update: self.tx_state_update,
-            notify_dgram_senders: self.notify_dgram_senders,
-            stage: Open { peer_id },
-        }
+    pub fn open(self, peer_id: PeerId) -> (Connection<Open>, Receiver<mpsc::Sender<Vec<u8>>>) {
+        let (notify_dgram_senders, dgram_senders) = channel::<mpsc::Sender<Vec<u8>>>(1);
+        (
+            Connection {
+                rtc: self.rtc,
+                channel_details: self.channel_details,
+                peer_address: self.peer_address,
+                local_address: self.local_address,
+                socket: self.socket,
+                tx_state_inquiry: self.tx_state_inquiry,
+                tx_state_update: self.tx_state_update,
+                stage: Open {
+                    peer_id,
+                    notify_dgram_senders,
+                },
+            },
+            dgram_senders,
+        )
     }
 
     /// Handle timeout

@@ -1,6 +1,6 @@
 //! Upgrades new connections with Noise Protocol.
 
-use crate::tokio::udp_manager::SocketOpenConnection;
+use crate::tokio::udp_manager::ConnectionContext;
 use crate::tokio::{
     connection::{Connection, OpeningEvent},
     error::Error,
@@ -51,8 +51,7 @@ pub(crate) async fn inbound(
     );
 
     // New Opening Connection
-    let (mut connection, notify) =
-        Connection::new(rtc.clone(), udp_manager.lock().unwrap().socket(), source);
+    let mut connection = Connection::new(rtc.clone(), udp_manager.lock().unwrap().socket(), source);
 
     // A relay tp this new Open Connection needs to be added to udp_manager
     udp_manager
@@ -128,27 +127,29 @@ pub(crate) async fn inbound(
     .await
     .map_err(|_| Error::NoiseHandshakeFailed)?;
 
-    let connection = connection.open(peer_id);
+    let (connection, mut notify) = connection.open(peer_id);
 
-    // let connection = Arc::new(AsyncMutex::new(connection));
-    //
-    // let connection_clone = connection.clone();
+    let mut connection_clone = connection.clone();
 
     // now that the connection is opened, we need to spawn an ongoing loop
     // for the connection events to be handled in an ongoing manner
-    // tokio::spawn(async move {
-    //     let mut connection = connection_clone.lock().await;
-    //     connection.run().await;
-    // });
+    tokio::spawn(async move {
+        connection_clone.run().await;
+    });
+
+    // receive on notify listenr
+    let tx = notify.try_next().map_err(|err| {
+        tracing::error!(target: LOG_TARGET, ?err, "failed to receive on notify connection that we are ready");
+        Error::Receive
+    })?
+    .ok_or(Error::Receive)?;
 
     // A relay tp this new Open Connection needs to be added to udp_manager
-    udp_manager.lock().unwrap().socket_open_conns.insert(
-        source,
-        SocketOpenConnection {
-            notifier: Some(notify),
-            sender: None,
-        },
-    );
+    udp_manager
+        .lock()
+        .unwrap()
+        .open
+        .insert(source, ConnectionContext { tx });
 
     Ok((peer_id, connection.into()))
 }
@@ -169,8 +170,7 @@ pub(crate) async fn outbound(
         outbound_rtc_client(remote_fingerprint, source, destination, dtls_cert);
 
     // New Opening Connection
-    let (mut connection, notify) =
-        Connection::new(rtc.clone(), udp_manager.lock().unwrap().socket(), source);
+    let mut connection = Connection::new(rtc.clone(), udp_manager.lock().unwrap().socket(), source);
 
     let (noise_stream, drop_listener) = connection
         .new_stream_from_data_channel_id(noise_channel_id)
@@ -212,7 +212,7 @@ pub(crate) async fn outbound(
     .await
     .map_err(|_| Error::NoiseHandshakeFailed)?;
 
-    let connection = connection.open(peer_id);
+    let (connection, mut notify) = connection.open(peer_id);
 
     let mut connection_clone = connection.clone();
 
@@ -222,14 +222,19 @@ pub(crate) async fn outbound(
         connection_clone.run().await;
     });
 
+    // receive on notify connection listener that we are ready to receive the Sender
+    let tx = notify.try_next().map_err(|err| {
+        tracing::error!(target: LOG_TARGET, ?err, "failed to receive on notify connection that we are ready");
+        Error::Receive
+    })?
+    .ok_or(Error::Receive)?;
+
     // This new Open Connection needs to be added to udp_manager.addr_conns
-    udp_manager.lock().unwrap().socket_open_conns.insert(
-        source,
-        SocketOpenConnection {
-            notifier: Some(notify),
-            sender: None,
-        },
-    );
+    udp_manager
+        .lock()
+        .unwrap()
+        .open
+        .insert(source, ConnectionContext { tx });
 
     Ok((peer_id, connection.into()))
 }

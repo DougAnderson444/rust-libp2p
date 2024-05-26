@@ -59,12 +59,9 @@ pub(crate) enum UDPManagerEvent {
 /// Initial Sender is a futures mpsc Option which is taken for Initialization,
 /// The second Sender is the regular sender to send datagrams to the Connection
 #[derive(Debug)]
-pub(crate) struct SocketOpenConnection {
-    /// The initial sender to notify the Connection that it's open.
-    pub(crate) notifier: Option<Receiver<mpsc::Sender<Vec<u8>>>>,
-
-    /// The sender to send datagrams to the Connection.
-    pub(crate) sender: Option<mpsc::Sender<Vec<u8>>>,
+pub(crate) struct ConnectionContext {
+    /// TX channel for sending datagrams to the connection event loop.
+    pub(crate) tx: mpsc::Sender<Vec<u8>>,
 }
 
 /// The `UDPManager` struct is responsible for managing the UDP connections used by the WebRTC transport.
@@ -79,7 +76,7 @@ pub(crate) struct UDPManager {
     pub(crate) socket_opening_conns: HashMap<SocketAddr, Connection>,
 
     /// Mapping of socket addresses to Open connections we have.
-    pub(crate) socket_open_conns: HashMap<SocketAddr, SocketOpenConnection>,
+    pub(crate) open: HashMap<SocketAddr, ConnectionContext>,
 }
 
 /// Whether this is a new connection that should be Polled or not.
@@ -127,7 +124,7 @@ impl UDPManager {
         Ok(Self {
             listen_addr: socket.local_addr()?,
             socket: Arc::new(socket),
-            socket_open_conns: Default::default(),
+            open: Default::default(),
             socket_opening_conns: Default::default(),
         })
     }
@@ -208,33 +205,10 @@ impl UDPManager {
         buffer: &[u8],
     ) -> Result<NewSource, error::Error> {
         // get the notified from the notifier in open connections
-        if let Some(SocketOpenConnection { notifier, sender }) =
-            self.socket_open_conns.get_mut(&source)
-        {
-            // take the notifier out of the Option, leaving None in it;s place
-            // if is Some, then recv from it before using the sender int he next step
-            if let Some(mut notifier) = notifier.take() {
-                let sndr = notifier.try_next().map_err(|_| Error::Disconnected)?;
-                *sender = sndr;
-            }
-
-            // If Open Connection exists, send the datagram to Input::Receive
-            match sender {
-                Some(sender) => {
-                    sender
-                        .try_send(buffer.to_vec())
-                        .map_err(|_| Error::Disconnected)?;
-                    return Ok(NewSource::No);
-                }
-                None => {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        "notifier was None for open connection from source: {}",
-                        source
-                    );
-                    return Err(Error::Disconnected);
-                }
-            }
+        if let Some(ConnectionContext { tx }) = self.open.get_mut(&source) {
+            tx.try_send(buffer.to_vec())
+                .map_err(|_| Error::Disconnected)?;
+            return Ok(NewSource::No);
         }
 
         // is stun packet?

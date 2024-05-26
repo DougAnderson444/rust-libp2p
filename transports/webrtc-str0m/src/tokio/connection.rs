@@ -167,10 +167,6 @@ pub struct Connection<Stage = Opening> {
     /// Receiver for state updates from a [PollDataChannel]. We only need one of these
     /// as this single Connection will be the only one sending updates.
     tx_state_update: mpsc::Sender<StateUpdate>,
-
-    /// Notifies any dgram sender that the Connection is ready to receive datagrams
-    /// Includes a mpsc Sender for the dgram sender to send datagrams to the Connection
-    notify_dgram_senders: Sender<mpsc::Sender<Vec<u8>>>,
 }
 
 impl<Stage> Unpin for Connection<Stage> {}
