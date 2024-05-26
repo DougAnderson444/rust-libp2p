@@ -12,7 +12,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use tokio::sync::Mutex as AsyncMutex;
 
 use libp2p_core::transport::{ListenerId, TransportError, TransportEvent};
 use libp2p_core::Multiaddr;
@@ -20,12 +19,11 @@ use libp2p_identity as identity;
 use libp2p_identity::PeerId;
 
 use crate::tokio::certificate::Certificate;
-use crate::tokio::connection::Connection;
 use crate::tokio::error::Error;
 use crate::tokio::fingerprint::Fingerprint;
 use crate::tokio::udp_manager::{UDPManager, UDPManagerEvent};
 
-use super::connection::Open;
+use super::connection::FullConnection;
 use super::upgrade;
 
 /// A WebRTC transport with direct p2p communication (without a STUN server).
@@ -58,7 +56,7 @@ impl Transport {
 }
 
 impl libp2p_core::Transport for Transport {
-    type Output = (PeerId, Connection<Open>);
+    type Output = (PeerId, FullConnection);
 
     type Error = Error;
 
@@ -74,9 +72,11 @@ impl libp2p_core::Transport for Transport {
         let addr =
             parse_webrtc_listen_addr(&addr).ok_or(TransportError::MultiaddrNotSupported(addr))?;
 
+        tracing::debug!("Listening on {:?}", addr);
+
         let udp_manager = Arc::new(Mutex::new(
             UDPManager::with_address(addr)
-                .map_err(|e| TransportError::Other(Error::Disconnected))?,
+                .map_err(|_e| TransportError::Other(Error::Disconnected))?,
         ));
 
         self.listeners.push(
@@ -201,9 +201,11 @@ impl ListenStream {
         let if_watcher;
         let pending_event;
         if listen_addr.ip().is_unspecified() {
+            tracing::debug!("Listening on all interfaces (0.0.0.0), starting IfWatcher");
             if_watcher = Some(IfWatcher::new()?);
             pending_event = None;
         } else {
+            tracing::debug!("Listening on {:?}. No IfWatcher started", listen_addr);
             if_watcher = None;
             let ma = socketaddr_to_multiaddr(&listen_addr, Some(config.fingerprint));
             pending_event = Some(TransportEvent::NewAddress {
@@ -316,6 +318,46 @@ impl Stream for ListenStream {
                 return Poll::Ready(closed.take());
             }
             if let Poll::Ready(event) = self.poll_if_watcher(cx) {
+                tracing::debug!("IfWatcher event: {:?}", event);
+
+                if let TransportEvent::NewAddress {
+                    ref listen_addr, ..
+                } = event
+                {
+                    // if not loopback, set self.listen_addr to the first non-loopback value
+                    match listen_addr.iter().next() {
+                        Some(Protocol::Ip4(ip)) => {
+                            if !ip.is_loopback()
+                                && !ip.is_unspecified()
+                                && !ip.is_link_local()
+                                && !ip.is_multicast()
+                                && self.listen_addr.ip().is_unspecified()
+                            {
+                                self.listen_addr =
+                                    SocketAddr::new(IpAddr::V4(ip), self.listen_addr.port());
+                                self.udp_manager
+                                    .lock()
+                                    .unwrap()
+                                    .set_listen_addr(self.listen_addr);
+                                tracing::debug!("New listen_addr set to: {:?}", self.listen_addr);
+                            }
+                        }
+                        Some(Protocol::Ip6(ip6)) => {
+                            if !ip6.is_loopback()
+                                && !ip6.is_unspecified()
+                                // && !ip6.is_unicast_link_local()
+                                && !ip6.is_multicast()
+                                && self.listen_addr.ip().is_unspecified()
+                            {
+                                self.listen_addr =
+                                    SocketAddr::new(IpAddr::V6(ip6), self.listen_addr.port());
+                                tracing::debug!("New listen_addr set to: {:?}", self.listen_addr);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 return Poll::Ready(Some(event));
             }
 
@@ -331,13 +373,10 @@ impl Stream for ListenStream {
                     let send_back_addr = socketaddr_to_multiaddr(&remote.addr, None);
 
                     let upgrade = upgrade::inbound(
-                        remote.addr,
-                        self.config.inner.clone(),
+                        remote, //.addr,
+                        self.listen_addr,
+                        self.config.clone(),
                         self.udp_manager.clone(),
-                        self.config.inner.dtls_cert().unwrap().clone(),
-                        remote.ufrag,
-                        self.config.id_keys.clone(),
-                        remote.stun_msg,
                     )
                     .boxed();
 
@@ -363,7 +402,7 @@ impl Stream for ListenStream {
 
 /// A config which holds peer's keys and a x509Cert used to authenticate WebRTC communications.
 #[derive(Clone)]
-struct Config {
+pub(crate) struct Config {
     inner: str0m::RtcConfig,
     fingerprint: Fingerprint,
     id_keys: identity::Keypair,
@@ -380,6 +419,16 @@ impl Config {
             fingerprint,
             id_keys,
         }
+    }
+
+    /// Get Dtls cert
+    pub(crate) fn dtls_cert(&self) -> Option<&str0m::change::DtlsCert> {
+        self.inner.dtls_cert()
+    }
+
+    /// Get id keys
+    pub(crate) fn id_keys(&self) -> &identity::Keypair {
+        &self.id_keys
     }
 }
 

@@ -57,8 +57,6 @@ impl Connection<Opening> {
                 stage: Opening::new(),
                 peer_address: PeerAddress(source),
                 local_address,
-                drop_listeners: Default::default(),
-                no_drop_listeners_waker: Default::default(),
                 channel_details: Default::default(),
                 tx_state_inquiry,
                 tx_state_update,
@@ -71,21 +69,17 @@ impl Connection<Opening> {
     /// Completes the connection opening process.
     /// The only way to get to Open is to go throguh Opening.
     /// Openin> to Open moves values into the Open state.
-    pub fn open(self, config: OpenConfig) -> Connection<Open> {
+    pub fn open(self, peer_id: PeerId) -> Connection<Open> {
         Connection {
             rtc: self.rtc,
             channel_details: self.channel_details,
             peer_address: self.peer_address,
             local_address: self.local_address,
             socket: self.socket,
-            no_drop_listeners_waker: self.no_drop_listeners_waker,
-            drop_listeners: self.drop_listeners,
             tx_state_inquiry: self.tx_state_inquiry,
             tx_state_update: self.tx_state_update,
             notify_dgram_senders: self.notify_dgram_senders,
-            stage: Open {
-                peer: config.peer_id,
-            },
+            stage: Open { peer_id },
         }
     }
 

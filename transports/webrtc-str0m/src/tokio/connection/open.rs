@@ -6,14 +6,7 @@ use super::*;
 #[derive(Debug, Clone)]
 pub struct Open {
     /// Remote peer ID.
-    pub(crate) peer: PeerId,
-}
-
-/// Configure the Open stage:
-#[derive(Debug)]
-pub struct OpenConfig {
-    /// Remote peer ID.
-    pub peer_id: PeerId,
+    pub(crate) peer_id: PeerId,
 }
 
 /// Impl Connectable for Open
@@ -67,27 +60,13 @@ impl Connectable for Open {
     }
 }
 
-// /// Impl Clone for Connection<Open>
-// impl Clone for Connection<Open> {
-//     fn clone(&self) -> Self {
-//         Self {
-//             rtc: self.rtc.clone(),
-//             stage: self.stage.clone(),
-//             local_address: self.local_address,
-//             peer_address: self.peer_address,
-//             drop_listeners: self.drop_listeners.clone(),
-//             channel_details: self.channel_details.clone(),
-//         }
-//     }
-// }
-
 /// Implementations that apply only to the Open Connection state.
 impl Connection<Open> {
     /// Connection to peer has been closed.
     fn on_connection_closed(&mut self) {
         tracing::trace!(
             target: LOG_TARGET,
-            peer = ?self.stage.peer,
+            peer = ?self.stage.peer_id,
             "connection closed",
         );
 
@@ -99,20 +78,27 @@ impl Connection<Open> {
     pub async fn run(&mut self) {
         tracing::trace!(
             target: LOG_TARGET,
-            peer = ?self.stage.peer, // TODO: Move peer to connection?
+            peer = ?self.stage.peer_id,
             "start webrtc connection event loop",
         );
 
         let (tx_dgram, mut dgram_rx) = mpsc::channel(DATAGRAM_BUFFER_SIZE);
         // Notify senders that we are ready to rx their dgrams
-        self.notify_dgram_senders.send(tx_dgram);
+        if let Err(e) = self.notify_dgram_senders.try_send(tx_dgram) {
+            tracing::error!(
+                target: LOG_TARGET,
+                ?e,
+                "failed to notify dgram senders",
+            );
+            return self.on_connection_closed();
+        }
 
         loop {
             // poll output until we get a timeout
             let Some(timeout) = self.rtc_poll_output() else {
                 tracing::trace!(
                     target: LOG_TARGET,
-                    peer = ?self.stage.peer,
+                    peer = ?self.stage.peer_id,
                     "connection closed",
                 );
                 return self.on_connection_closed();
@@ -151,7 +137,7 @@ impl Connection<Open> {
                                 None => {
                                     tracing::trace!(
                                         target: LOG_TARGET,
-                                        peer = ?self.stage.peer,
+                                        peer = ?self.stage.peer_id,
                                         "read `None` from `dgram_rx`",
                                     );
                                     return self.on_connection_closed();

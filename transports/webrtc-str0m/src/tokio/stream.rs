@@ -8,14 +8,11 @@ use std::{
 
 use futures::prelude::*;
 use poll_data_channel::PollDataChannel;
-use send_wrapper::SendWrapper;
 use str0m::{channel::ChannelId, Rtc};
 use tokio::sync::mpsc;
 
-pub(crate) use super::channel::{ReadInquiry, StateInquiry};
-
 use super::{
-    channel::{ChannelWakers, Inquiry, RtcDataChannelState},
+    channel::{ChannelWakers, Inquiry},
     Error,
 };
 
@@ -27,7 +24,7 @@ pub struct Stream {
     inner: libp2p_webrtc_utils::Stream<PollDataChannel>,
 }
 
-pub(crate) type DropListener = Box<libp2p_webrtc_utils::DropListener<PollDataChannel>>;
+pub(crate) type DropListener = libp2p_webrtc_utils::DropListener<PollDataChannel>;
 
 impl Stream {
     pub(crate) fn new(
@@ -47,7 +44,7 @@ impl Stream {
             Self {
                 inner, // : SendWrapper::new(inner),
             },
-            Box::new(drop_listener),
+            drop_listener,
         ))
     }
 }

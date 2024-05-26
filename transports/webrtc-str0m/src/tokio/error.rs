@@ -70,6 +70,9 @@ pub enum Error {
     /// From oneshot::canceled
     #[error("oneshot canceled")]
     OneshotCanceled(#[from] futures::channel::oneshot::Canceled),
+
+    #[error("Opening Connection inut rejected")]
+    InputRejected,
 }
 
 impl Error {

@@ -150,7 +150,7 @@ pub fn random_ufrag() -> String {
         "libp2p+webrtc+v1/{}",
         thread_rng()
             .sample_iter(&Alphanumeric)
-            .take(64)
+            .take(32)
             .map(char::from)
             .collect::<String>()
     )

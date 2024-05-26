@@ -23,7 +23,7 @@ use tower_http::cors::{Any, CorsLayer};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("browser_webrtc_example=debug,libp2p_webrtc=info,libp2p_ping=debug")
+        .with_env_filter("browser_webrtc_example=debug,libp2p_webrtc_str0m=trace,libp2p_ping=debug")
         .try_init();
 
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()

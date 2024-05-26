@@ -8,14 +8,19 @@ use futures::channel::mpsc::{Receiver, Sender};
 use libp2p_core::transport::ListenerId;
 use libp2p_identity::PeerId;
 use socket2::{Domain, Socket, Type};
-use std::sync::{Arc, Mutex};
 use std::{
     collections::HashMap,
     net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
 };
-use str0m::ice::{IceCreds, StunMessage};
+use std::{sync::Arc, time::Instant};
+use str0m::net::Protocol as Str0mProtocol;
+use str0m::{
+    ice::{IceCreds, StunMessage},
+    net::{DatagramRecv, Receive},
+    Input,
+};
 use tokio::{
     io::ReadBuf,
     net::UdpSocket,
@@ -34,7 +39,7 @@ pub(crate) struct NewRemoteAddress {
     pub(crate) addr: SocketAddr,
     pub(crate) ufrag: String,
     pub(crate) pass: String,
-    pub(crate) stun_msg: Vec<u8>,
+    pub(crate) contents: Vec<u8>,
 }
 
 /// Events emitted by the [`UDPManager`].
@@ -48,23 +53,6 @@ pub(crate) enum UDPManagerEvent {
     NewRemoteAddress(NewRemoteAddress),
     /// Error event.
     Error(error::Error),
-}
-
-/// Connection context.
-struct ConnectionContext {
-    /// Remote peer ID.
-    peer: PeerId,
-
-    /// Connection ID.
-    connection_id: ListenerId,
-
-    /// TX channel for sending datagrams to the connection event loop.
-    tx: Sender<Vec<u8>>,
-}
-
-enum ConnectionState {
-    Open(Connection<Open>),
-    Opening(Connection<Opening>),
 }
 
 /// A struct which handles Socket Open Connection process
@@ -86,6 +74,9 @@ pub(crate) struct UDPManager {
 
     /// The socket listen address.
     listen_addr: SocketAddr,
+
+    /// Opening connections.
+    pub(crate) socket_opening_conns: HashMap<SocketAddr, Connection>,
 
     /// Mapping of socket addresses to Open connections we have.
     pub(crate) socket_open_conns: HashMap<SocketAddr, SocketOpenConnection>,
@@ -127,16 +118,28 @@ impl UDPManager {
 
         let socket = UdpSocket::from_std(socket.into())?;
 
+        tracing::info!(
+            target: LOG_TARGET,
+            "webrtc udp socket bound to: {}",
+            socket.local_addr()?,
+        );
+
         Ok(Self {
             listen_addr: socket.local_addr()?,
             socket: Arc::new(socket),
-            socket_open_conns: HashMap::new(),
+            socket_open_conns: Default::default(),
+            socket_opening_conns: Default::default(),
         })
     }
 
     /// Returns the listen address of the UDP socket.
     pub(crate) fn listen_addr(&self) -> SocketAddr {
         self.listen_addr
+    }
+
+    /// Set the address
+    pub(crate) fn set_listen_addr(&mut self, addr: SocketAddr) {
+        self.listen_addr = addr;
     }
 
     /// Reads from the underlying UDP socket and processes the received data.
@@ -166,12 +169,18 @@ impl UDPManager {
                     match this.handle_socket_input(source, &buf) {
                         Ok(NewSource::No) => { /* Existing connection, handled. */ }
                         Ok(NewSource::Yes(ice_creds)) => {
+                            tracing::trace!(
+                                target: LOG_TARGET,
+                                "new remote address: {} with ice creds: {:?}",
+                                source,
+                                ice_creds
+                            );
                             let ready =
                                 Poll::Ready(UDPManagerEvent::NewRemoteAddress(NewRemoteAddress {
                                     addr: source,
                                     ufrag: ice_creds.ufrag,
                                     pass: ice_creds.pass,
-                                    stun_msg: buf,
+                                    contents: buf,
                                 }));
                             return ready;
                         }
@@ -182,7 +191,7 @@ impl UDPManager {
                 }
             }
         }
-        return Poll::Pending;
+        Poll::Pending
     }
 
     /// Handle socket input.
@@ -228,6 +237,21 @@ impl UDPManager {
             }
         }
 
+        // is stun packet?
+        if is_stun_packet(buffer) {
+            tracing::trace!(
+                target: LOG_TARGET,
+                "received STUN message from source: {}",
+                source
+            );
+        } else {
+            tracing::trace!(
+                target: LOG_TARGET,
+                "received non-stun message from source: {}",
+                source
+            );
+        }
+
         // 2) Otherwise we haven't seen this source address before, it should be Stun, and we return the ICE creds (ufrag, pass)
         match StunMessage::parse(buffer) {
             // .map_err(|op| Error::NetError(str0m::error::NetError::Stun(op)))?;
@@ -237,6 +261,14 @@ impl UDPManager {
                     .ok_or(Error::Authentication)
                     .map_err(|_| Error::InvalidData)?;
 
+                tracing::trace!(
+                    target: LOG_TARGET,
+                    "received STUN message from source: {}, ufrag: {}, pass: {}",
+                    source,
+                    ufrag,
+                    pass
+                );
+
                 Ok(NewSource::Yes(IceCreds {
                     ufrag: ufrag.to_owned(),
                     pass: pass.to_owned(),
@@ -245,24 +277,54 @@ impl UDPManager {
             Err(err) => {
                 tracing::warn!(
                     target: LOG_TARGET,
-                    "received non-stun message while opening from source: {}, \n\n err: {} \n\n msg: {:?}",
+                    "StunMessage didn't parse, received non-stun message while opening from source: {}, \n\n err: {} \n\n msg: {:?}",
                     source,
                     err,
                     String::from_utf8_lossy(buffer)
                 );
-                // TODO: Input::Receive and handle_input? of non-stun?
+                // TODO: Input::Receive and handle_input? of non-stun
+                let contents: DatagramRecv = buffer.try_into().map_err(|_| Error::InvalidData)?;
+
+                if let Some(conn) = self.socket_opening_conns.get_mut(&source) {
+                    tracing::trace!(
+                        target: LOG_TARGET,
+                        peer = ?conn.peer_address,
+                        "handle input from peer",
+                    );
+
+                    let message = Input::Receive(
+                        Instant::now(),
+                        Receive {
+                            source: *conn.peer_address,
+                            proto: Str0mProtocol::Udp,
+                            destination: conn.local_address,
+                            contents,
+                        },
+                    );
+
+                    match conn.rtc().lock().unwrap().accepts(&message) {
+                        true => conn.rtc().lock().unwrap().handle_input(message).map_err(|error| {
+                            tracing::debug!(target: LOG_TARGET, source = ?conn.peer_address, ?error, "failed to handle data");
+                            Error::InputRejected
+                        })?,
+                        false => {
+                            tracing::warn!(
+                                target: LOG_TARGET,
+                                peer = ?conn.peer_address,
+                                "input rejected",
+                            );
+                            return Err(Error::InputRejected);
+                        }
+                    }
+                }
 
                 Ok(NewSource::No)
             }
         }
-        // let (ufrag, pass) = binding
-        //     .split_username()
-        //     .ok_or(Error::Authentication)
-        //     .map_err(|_| Error::InvalidData)?;
-        //
-        // Ok(NewSource::Yes(IceCreds {
-        //     ufrag: ufrag.to_owned(),
-        //     pass: pass.to_owned(),
-        // }))
     }
+}
+
+fn is_stun_packet(bytes: &[u8]) -> bool {
+    // 20 bytes for the header, then follows attributes.
+    bytes.len() >= 20 && bytes[0] < 2
 }

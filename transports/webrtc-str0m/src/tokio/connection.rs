@@ -6,11 +6,11 @@
 //! The [`Opening`] stage is responsible for the initial handshake with the remote peer. It goes
 //! through several [`HandshakeState`]s until the connection is opened. Then Opening connection
 //! is moved to Open stage once Noise upgrade is complete.
-
+mod core;
 mod open;
 mod opening;
 
-pub(crate) use self::open::{Open, OpenConfig};
+pub(crate) use self::open::Open;
 pub(crate) use self::opening::Opening;
 use crate::tokio::channel::{InquiryType, StateValues};
 use crate::tokio::fingerprint::Fingerprint;
@@ -136,7 +136,7 @@ impl Deref for PeerAddress {
 }
 
 /// The WebRTC Connections as each of the various states
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Connection<Stage = Opening> {
     // state: std::marker::PhantomData<Stage>,
     /// Stage goes from Opening to Open. Holds out stage-specific values.
@@ -152,16 +152,10 @@ pub struct Connection<Stage = Opening> {
     rtc: Arc<Mutex<Rtc>>,
 
     /// Peer address Newtype
-    peer_address: PeerAddress,
+    pub(crate) peer_address: PeerAddress,
 
     /// This peer's local address.
-    local_address: SocketAddr,
-
-    /// A list of futures, which, once completed, signal that a [`Stream`] has been dropped.
-    drop_listeners: FuturesUnordered<DropListener>,
-
-    /// Is set when there are no drop listeners,
-    no_drop_listeners_waker: Option<Waker>,
+    pub(crate) local_address: SocketAddr,
 
     /// Channel for state inquiries for [ChannelId]. We need an inquiry [Sender] for
     /// each channel, as each channel has a unique state.
@@ -393,10 +387,10 @@ impl<Stage> Connection<Stage> {
     }
 
     /// New Stream from Data Channel ID
-    pub fn new_stream_from_data_channel_id(
+    pub(crate) fn new_stream_from_data_channel_id(
         &mut self,
         channel_id: ChannelId,
-    ) -> Result<Stream, Error> {
+    ) -> Result<(Stream, DropListener), Error> {
         let wakers = ChannelWakers::default();
 
         let (stream, drop_listener) = Stream::new(
@@ -416,14 +410,7 @@ impl<Stage> Connection<Stage> {
             })),
         );
 
-        // TODO: Verify that noise channels are dropped correctly from this list
-        self.drop_listeners.push(drop_listener);
-
-        // Wake .poll()
-        if let Some(waker) = self.no_drop_listeners_waker.take() {
-            waker.wake()
-        }
-        Ok(stream)
+        Ok((stream, drop_listener))
     }
 }
 
@@ -537,9 +524,37 @@ pub(crate) fn state_loop(
         }
     });
 }
+
+/// The Full Connection is just Connection<Open> with the DropListener. We do this so we can
+/// clone the inner connection and move it into a tokio task.
+pub struct FullConnection {
+    /// The Connection in the Open state.
+    inner: Connection<Open>,
+
+    /// A list of futures, which, once completed, signal that a [`Stream`] has been dropped.
+    drop_listeners: FuturesUnordered<DropListener>,
+
+    /// Is set when there are no drop listeners,
+    no_drop_listeners_waker: Option<Waker>,
+}
+
+/// From Connection<Open> to FullConnection adds
+///
+/// drop_listeners: Default::default(),
+/// no_drop_listeners_waker: Default::default(),
+impl From<Connection<Open>> for FullConnection {
+    fn from(inner: Connection<Open>) -> Self {
+        Self {
+            inner,
+            drop_listeners: Default::default(),
+            no_drop_listeners_waker: Default::default(),
+        }
+    }
+}
+
 /// WebRTC native multiplexing of [Open] [Connection]s.
 /// Allow users to open their substreams
-impl StreamMuxer for Connection<Open> {
+impl StreamMuxer for FullConnection {
     type Substream = Stream;
     type Error = Error;
 
@@ -551,6 +566,7 @@ impl StreamMuxer for Connection<Open> {
 
         // send inquiry for new data channels
         if let Err(e) = self
+            .inner
             .tx_state_inquiry
             .try_send(Inquiry {
                 channel_id: None,
@@ -564,7 +580,17 @@ impl StreamMuxer for Connection<Open> {
         // wait for inbound data channels to be ready
         match ready!(rx.poll_unpin(cx)) {
             Ok(channel_id) => {
-                let stream = self.new_stream_from_data_channel_id(channel_id)?;
+                let (stream, drop_listener) =
+                    self.inner.new_stream_from_data_channel_id(channel_id)?;
+
+                // TODO: Verify that noise channels are dropped correctly from this list
+                self.drop_listeners.push(drop_listener);
+
+                // Wake .poll()
+                if let Some(waker) = self.no_drop_listeners_waker.take() {
+                    waker.wake()
+                }
+
                 Poll::Ready(Ok(stream))
             }
             Err(err) => {
