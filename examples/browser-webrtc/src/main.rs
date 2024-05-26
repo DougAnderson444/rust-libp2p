@@ -14,14 +14,13 @@ use libp2p::{
     ping,
     swarm::SwarmEvent,
 };
-use libp2p_webrtc as webrtc;
-use rand::thread_rng;
+use libp2p_webrtc_str0m as webrtc;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("browser_webrtc_example=debug,libp2p_webrtc=info,libp2p_ping=debug")
@@ -32,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
         .with_other_transport(|id_keys| {
             Ok(webrtc::tokio::Transport::new(
                 id_keys.clone(),
-                webrtc::tokio::Certificate::generate(&mut thread_rng())?,
+                webrtc::tokio::Certificate::generate(),
             )
             .map(|(peer_id, conn), _| (peer_id, StreamMuxerBox::new(conn))))
         })?
