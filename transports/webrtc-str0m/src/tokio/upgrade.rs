@@ -57,7 +57,7 @@ pub(crate) async fn inbound(
     udp_manager
         .lock()
         .unwrap()
-        .socket_opening_conns
+        .opening
         .insert(source, connection.clone());
 
     let (noise_stream, drop_listener) = connection

@@ -13,6 +13,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 use std::{sync::Arc, time::Instant};
 use str0m::net::Protocol as Str0mProtocol;
@@ -73,7 +74,7 @@ pub(crate) struct UDPManager {
     listen_addr: SocketAddr,
 
     /// Opening connections.
-    pub(crate) socket_opening_conns: HashMap<SocketAddr, Connection>,
+    pub(crate) opening: HashMap<SocketAddr, Connection<Opening>>,
 
     /// Mapping of socket addresses to Open connections we have.
     pub(crate) open: HashMap<SocketAddr, ConnectionContext>,
@@ -83,6 +84,22 @@ pub(crate) struct UDPManager {
 enum NewSource {
     Yes(IceCreds),
     No,
+}
+
+/// Events received from opening connections that are handled
+/// by the [`WebRtcTransport`] event loop.
+enum ConnectionEvent {
+    /// Connection established.
+    ConnectionEstablished,
+
+    /// Connection to peer closed.
+    ConnectionClosed,
+
+    /// Timeout.
+    Timeout {
+        /// Timeout duration.
+        duration: Duration,
+    },
 }
 
 impl UDPManager {
@@ -125,7 +142,7 @@ impl UDPManager {
             listen_addr: socket.local_addr()?,
             socket: Arc::new(socket),
             open: Default::default(),
-            socket_opening_conns: Default::default(),
+            opening: Default::default(),
         })
     }
 
@@ -163,7 +180,7 @@ impl UDPManager {
                     let nread = read_buf.filled().len();
                     buf.truncate(nread);
 
-                    match this.handle_socket_input(source, &buf) {
+                    match this.on_socket_input(source, &buf) {
                         Ok(NewSource::No) => { /* Existing connection, handled. */ }
                         Ok(NewSource::Yes(ice_creds)) => {
                             tracing::trace!(
@@ -199,7 +216,7 @@ impl UDPManager {
     /// until it timeouts.
     ///
     /// Returns `true` if the client should be polled.
-    fn handle_socket_input(
+    fn on_socket_input(
         &mut self,
         source: SocketAddr,
         buffer: &[u8],
@@ -259,7 +276,7 @@ impl UDPManager {
                 // TODO: Input::Receive and handle_input? of non-stun
                 let contents: DatagramRecv = buffer.try_into().map_err(|_| Error::InvalidData)?;
 
-                if let Some(conn) = self.socket_opening_conns.get_mut(&source) {
+                if let Some(conn) = self.opening.get_mut(&source) {
                     tracing::trace!(
                         target: LOG_TARGET,
                         peer = ?conn.peer_address,
@@ -295,6 +312,11 @@ impl UDPManager {
                 Ok(NewSource::No)
             }
         }
+    }
+
+    /// Poll opening connection.
+    fn poll_connection(&mut self, source: &SocketAddr) -> ConnectionEvent {
+        todo!()
     }
 }
 

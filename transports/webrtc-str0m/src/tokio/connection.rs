@@ -7,8 +7,8 @@
 //! through several [`HandshakeState`]s until the connection is opened. Then Opening connection
 //! is moved to Open stage once Noise upgrade is complete.
 mod core;
-mod open;
-mod opening;
+pub(crate) mod open;
+pub(crate) mod opening;
 
 pub(crate) use self::open::Open;
 pub(crate) use self::opening::Opening;
