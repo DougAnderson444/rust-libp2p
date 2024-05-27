@@ -223,24 +223,28 @@ impl UDPManager {
     ) -> Result<NewSource, error::Error> {
         // get the notified from the notifier in open connections
         if let Some(ConnectionContext { tx }) = self.open.get_mut(&source) {
-            tx.try_send(buffer.to_vec())
-                .map_err(|_| Error::Disconnected)?;
+            match tx.try_send(buffer.to_vec()) {
+                Ok(_) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        "connection buffer full, dropping packet from source: {}",
+                        source
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        "connection closed, dropping packet from source: {}",
+                        source
+                    );
+                }
+            }
             return Ok(NewSource::No);
         }
 
-        // is stun packet?
-        if is_stun_packet(buffer) {
-            tracing::trace!(
-                target: LOG_TARGET,
-                "received STUN message from source: {}",
-                source
-            );
-        } else {
-            tracing::trace!(
-                target: LOG_TARGET,
-                "received non-stun message from source: {}",
-                source
-            );
+        if buffer.is_empty() {
+            return Err(Error::InvalidData);
         }
 
         // 2) Otherwise we haven't seen this source address before, it should be Stun, and we return the ICE creds (ufrag, pass)
@@ -276,6 +280,14 @@ impl UDPManager {
                 // TODO: Input::Receive and handle_input? of non-stun
                 let contents: DatagramRecv = buffer.try_into().map_err(|_| Error::InvalidData)?;
 
+                // Pretty rpitn contents
+                tracing::trace!(
+                    target: LOG_TARGET,
+                    "received non-stun message from source: {}, contents: {:?}",
+                    source,
+                    contents
+                );
+
                 if let Some(conn) = self.opening.get_mut(&source) {
                     tracing::trace!(
                         target: LOG_TARGET,
@@ -288,14 +300,14 @@ impl UDPManager {
                         Receive {
                             source: *conn.peer_address,
                             proto: Str0mProtocol::Udp,
-                            destination: conn.local_address,
+                            destination: conn.local_addr,
                             contents,
                         },
                     );
 
                     match conn.rtc().lock().unwrap().accepts(&message) {
                         true => conn.rtc().lock().unwrap().handle_input(message).map_err(|error| {
-                            tracing::debug!(target: LOG_TARGET, source = ?conn.peer_address, ?error, "failed to handle data");
+                            tracing::debug!(target: LOG_TARGET, source = ?conn.peer_address, ?error, "failed to handle incomign non-stun data");
                             Error::InputRejected
                         })?,
                         false => {

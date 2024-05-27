@@ -34,9 +34,12 @@ impl Opening {
 /// Implementations that apply only to the Opening Connection state.
 impl Connection<Opening> {
     /// Creates a new `Connection` in the Opening state.
-    pub fn new(rtc: Arc<Mutex<Rtc>>, socket: Arc<UdpSocket>, source: SocketAddr) -> Self {
-        let local_address = socket.local_addr().unwrap();
-
+    pub fn new(
+        rtc: Arc<Mutex<Rtc>>,
+        local_addr: SocketAddr,
+        socket: Arc<UdpSocket>,
+        source: SocketAddr,
+    ) -> Self {
         // Make the state_inquiry channel
         let (tx_state_inquiry, rx_state_inquiry) = mpsc::channel::<Inquiry>(4);
 
@@ -49,7 +52,7 @@ impl Connection<Opening> {
             socket,
             stage: Opening::new(),
             peer_address: PeerAddress(source),
-            local_address,
+            local_addr,
             channel_details: Default::default(),
             tx_state_inquiry,
             tx_state_update,
@@ -66,7 +69,7 @@ impl Connection<Opening> {
                 rtc: self.rtc,
                 channel_details: self.channel_details,
                 peer_address: self.peer_address,
-                local_address: self.local_address,
+                local_addr: self.local_addr,
                 socket: self.socket,
                 tx_state_inquiry: self.tx_state_inquiry,
                 tx_state_update: self.tx_state_update,
@@ -117,6 +120,11 @@ impl Connectable for Opening {
     /// Return [WebRtcEvent::Timeout] when an error occurs while [`Opening`].
     fn on_output_timeout(&mut self, rtc: Arc<Mutex<Rtc>>, timeout: Instant) -> Self::Output {
         let duration = timeout - Instant::now();
+        tracing::debug!(
+            target: LOG_TARGET,
+            ?duration,
+            "timeout duration",
+        );
         match duration.is_zero() {
             true => {
                 if let Err(error) = rtc
@@ -163,6 +171,11 @@ impl Connectable for Opening {
     }
 
     fn on_event_connected(&mut self, rtc: Arc<Mutex<Rtc>>) -> Self::Output {
+        tracing::debug!(
+            target: LOG_TARGET,
+            // connection_id = ?self.connection_id,
+            "opening Noise connection established",
+        );
         match std::mem::replace(&mut self.handshake_state, HandshakeState::Poisoned) {
             // Initial State should be Closed before we connect
             HandshakeState::Closed => {

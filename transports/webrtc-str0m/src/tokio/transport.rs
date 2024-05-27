@@ -184,7 +184,7 @@ struct ListenStream {
 
     /// Pending event to reported. In our case, if a Item = [TransportEvent::NewAddress] event
     /// occurs,
-    pending_event: Option<<Self as Stream>::Item>,
+    pending_events: Option<<Self as Stream>::Item>,
 
     /// The stream must be awaken after it has been closed to deliver the last event.
     close_listener_waker: Option<Waker>,
@@ -221,7 +221,7 @@ impl ListenStream {
             udp_manager,
             report_closed: None,
             if_watcher,
-            pending_event,
+            pending_events: pending_event,
             close_listener_waker: None,
         })
     }
@@ -307,7 +307,7 @@ impl Stream for ListenStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             // If a [TransportEvent::NewAddress] event is pending, return it.
-            if let Some(event) = self.pending_event.take() {
+            if let Some(event) = self.pending_events.take() {
                 return Poll::Ready(Some(event));
             }
             // If a Listener has been closed

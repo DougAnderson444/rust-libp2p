@@ -155,7 +155,7 @@ pub struct Connection<Stage = Opening> {
     pub(crate) peer_address: PeerAddress,
 
     /// This peer's local address.
-    pub(crate) local_address: SocketAddr,
+    pub(crate) local_addr: SocketAddr,
 
     /// Channel for state inquiries for [ChannelId]. We need an inquiry [Sender] for
     /// each channel, as each channel has a unique state.

@@ -128,7 +128,7 @@ impl Connection<Open> {
                                         Receive {
                                             proto: Str0mProtocol::Udp,
                                             source: *self.peer_address,
-                                            destination: self.local_address,
+                                            destination: self.local_addr,
                                             contents: datagram.as_slice().try_into().unwrap(),
                                         },
                                     );

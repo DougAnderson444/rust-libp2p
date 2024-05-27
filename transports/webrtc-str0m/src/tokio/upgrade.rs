@@ -50,22 +50,12 @@ pub(crate) async fn inbound(
         config.dtls_cert().unwrap().clone(),
     );
 
-    // New Opening Connection
-    let mut connection = Connection::new(rtc.clone(), udp_manager.lock().unwrap().socket(), source);
+    // Load the source and destination candidates into the Rtc object
+    rtc.lock()
+        .map_err(|_| Error::LockPoisoned)?
+        .handle_input(Input::Timeout(Instant::now()))?;
 
-    // A relay tp this new Open Connection needs to be added to udp_manager
-    udp_manager
-        .lock()
-        .unwrap()
-        .opening
-        .insert(source, connection.clone());
-
-    let (noise_stream, drop_listener) = connection
-        .new_stream_from_data_channel_id(noise_channel_id)
-        .map_err(|_| Error::StreamCreationFailed)?;
-
-    // we don't track noise drops
-    drop(drop_listener);
+    tracing::debug!(target: LOG_TARGET, "handle_input from new inbound connection from address {} to {}", source, destination);
 
     // Cast the datagram into a str0m::Receive and pass it to the str0m client
     rtc.lock()
@@ -80,6 +70,23 @@ pub(crate) async fn inbound(
             },
         ))?;
 
+    // New Opening Connection
+    let mut connection = Connection::new(
+        rtc.clone(),
+        destination,
+        udp_manager.lock().unwrap().socket(),
+        source,
+    );
+
+    // A relay tp this new Open Connection needs to be added to udp_manager
+    udp_manager
+        .lock()
+        .unwrap()
+        .opening
+        .insert(source, connection.clone());
+
+    // -- Ok(true)
+
     // Poll the connection to make progress towards an OpeningEvent.
     let event = loop {
         match connection.poll_progress() {
@@ -88,20 +95,8 @@ pub(crate) async fn inbound(
             }
             OpeningEvent::Timeout { timeout } => {
                 tracing::debug!(target: LOG_TARGET, "inbound opening connection upgrade timed out: {:?}", timeout);
-
-                let contents: DatagramRecv = remote.contents.as_slice().try_into()?;
-                // Cast the datagram into a str0m::Receive and pass it to the str0m client
-                rtc.lock()
-                    .map_err(|_| Error::LockPoisoned)?
-                    .handle_input(Input::Receive(
-                        Instant::now(),
-                        Receive {
-                            source,
-                            proto: Str0mProtocol::Udp,
-                            destination,
-                            contents,
-                        },
-                    ))?;
+                // sleep for  1 second
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 continue;
             }
             // Opened or Closed
@@ -114,6 +109,13 @@ pub(crate) async fn inbound(
     let OpeningEvent::ConnectionOpened { remote_fingerprint } = event else {
         return Err(Error::Disconnected);
     };
+
+    let (noise_stream, drop_listener) = connection
+        .new_stream_from_data_channel_id(noise_channel_id)
+        .map_err(|_| Error::StreamCreationFailed)?;
+
+    // we don't track noise drops
+    drop(drop_listener);
 
     let client_fingerprint: crate::tokio::Fingerprint =
         config.dtls_cert().unwrap().fingerprint().into();
@@ -170,7 +172,12 @@ pub(crate) async fn outbound(
         outbound_rtc_client(remote_fingerprint, source, destination, dtls_cert);
 
     // New Opening Connection
-    let mut connection = Connection::new(rtc.clone(), udp_manager.lock().unwrap().socket(), source);
+    let mut connection = Connection::new(
+        rtc.clone(),
+        destination,
+        udp_manager.lock().unwrap().socket(),
+        source,
+    );
 
     let (noise_stream, drop_listener) = connection
         .new_stream_from_data_channel_id(noise_channel_id)
@@ -265,7 +272,7 @@ pub(crate) fn make_rtc_client(
         ufrag: ufrag.to_owned(),
         pass: pass.to_owned(),
     });
-    rtc.direct_api().set_ice_controlling(false);
+    rtc.direct_api().set_ice_controlling(true);
     rtc.direct_api().start_dtls(false).unwrap();
     rtc.direct_api().start_sctp(false);
 
