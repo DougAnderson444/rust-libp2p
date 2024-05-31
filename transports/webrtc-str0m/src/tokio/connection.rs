@@ -13,7 +13,6 @@ pub(crate) mod opening;
 pub(crate) use self::open::Open;
 pub(crate) use self::opening::Opening;
 use crate::tokio::channel::{InquiryType, StateValues};
-use crate::tokio::fingerprint::Fingerprint;
 use crate::tokio::UdpSocket;
 
 use futures::channel::mpsc::Sender;
@@ -34,6 +33,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Instant,
 };
+use str0m::net::DatagramSend;
 use str0m::{
     channel::ChannelId,
     net::{Protocol as Str0mProtocol, Receive},
@@ -85,25 +85,35 @@ pub trait Connectable {
     fn on_event(&self, event: Event) -> Self::Output;
 }
 
-/// WebRTC Connection Opening Events
+/// WebRTC connection event.
 #[derive(Debug)]
-pub enum OpeningEvent {
+pub enum WebRtcEvent {
     /// Register timeout for the connection.
     Timeout {
         /// Timeout.
         timeout: Instant,
     },
 
+    /// Transmit data to remote peer.
+    Transmit {
+        /// Destination.
+        destination: SocketAddr,
+
+        /// Datagram to transmit.
+        datagram: DatagramSend,
+    },
+
     /// Connection closed.
     ConnectionClosed,
 
     /// Connection established.
-    ConnectionOpened { remote_fingerprint: Fingerprint },
+    ConnectionOpened, // { remote_fingerprint: Fingerprint },
+
     /// This is the default
     None,
 }
 
-impl Default for OpeningEvent {
+impl Default for WebRtcEvent {
     fn default() -> Self {
         Self::None
     }
@@ -111,7 +121,7 @@ impl Default for OpeningEvent {
 
 /// Opening Connection state.
 #[derive(Debug, Clone)]
-pub(crate) enum HandshakeState {
+pub(crate) enum State {
     /// Connection is poisoned.
     Poisoned,
 

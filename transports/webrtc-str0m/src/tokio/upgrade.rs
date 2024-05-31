@@ -2,7 +2,7 @@
 
 use crate::tokio::udp_manager::ConnectionContext;
 use crate::tokio::{
-    connection::{Connection, OpeningEvent},
+    connection::{Connection, WebRtcEvent},
     error::Error,
     udp_manager::UDPManager,
 };
@@ -23,94 +23,54 @@ use str0m::{net::Protocol as Str0mProtocol, Candidate};
 use super::connection::FullConnection;
 use super::fingerprint;
 use super::transport::Config;
-use super::udp_manager::NewRemoteAddress;
+use super::udp_manager::NewRemote;
 
 /// The log target for this module.
 const LOG_TARGET: &str = "libp2p_webrtc_str0m";
 
 /// Upgrades a new inbound WebRTC connection ith Noise Protocol.
 pub(crate) async fn inbound(
-    remote: NewRemoteAddress, // id_keys: identity::Keypair,
+    remote: NewRemote, // id_keys: identity::Keypair,
     destination: SocketAddr,
     config: Config,
     udp_manager: Arc<Mutex<UDPManager>>,
 ) -> Result<(PeerId, FullConnection), Error> {
     let source = remote.addr;
 
-    tracing::debug!(target: LOG_TARGET, address=%source, ufrag=%remote.ufrag, "new inbound connection from address");
-
-    let contents: DatagramRecv = remote.contents.as_slice().try_into()?;
-
-    // Create new `Rtc` object for this source
-    let (rtc, noise_channel_id) = make_rtc_client(
-        &remote.ufrag,
-        &remote.ufrag,
-        source,
-        destination,
-        config.dtls_cert().unwrap().clone(),
-    );
-
-    // Load the source and destination candidates into the Rtc object
-    rtc.lock()
-        .map_err(|_| Error::LockPoisoned)?
-        .handle_input(Input::Timeout(Instant::now()))?;
-
     tracing::debug!(target: LOG_TARGET, "handle_input from new inbound connection from address {} to {}", source, destination);
 
-    // Cast the datagram into a str0m::Receive and pass it to the str0m client
-    rtc.lock()
-        .map_err(|_| Error::LockPoisoned)?
-        .handle_input(Input::Receive(
-            Instant::now(),
-            Receive {
-                source,
-                proto: Str0mProtocol::Udp,
-                destination,
-                contents,
-            },
-        ))?;
+    // let mut connection = udp_manager
+    //     .lock()
+    //     .unwrap()
+    //     .opening
+    //     .get(&source)
+    //     .ok_or(Error::ConnectionDoesntExist)?;
 
-    // New Opening Connection
-    let mut connection = Connection::new(
-        rtc.clone(),
-        destination,
-        udp_manager.lock().unwrap().socket(),
-        source,
-    );
-
-    // A relay tp this new Open Connection needs to be added to udp_manager
-    udp_manager
+    let noise_channel_id = udp_manager
         .lock()
         .unwrap()
         .opening
-        .insert(source, connection.clone());
+        .get(&source)
+        .ok_or(Error::ConnectionDoesntExist)?
+        .rtc()
+        .lock()
+        .unwrap()
+        .direct_api()
+        .create_data_channel(ChannelConfig {
+            label: "noise".to_string(),
+            ordered: false,
+            reliability: Default::default(),
+            negotiated: Some(0),
+            protocol: "".to_string(),
+        });
 
-    // -- Ok(true)
-
-    // Poll the connection to make progress towards an OpeningEvent.
-    let event = loop {
-        match connection.poll_progress() {
-            OpeningEvent::None => {
-                continue;
-            }
-            OpeningEvent::Timeout { timeout } => {
-                tracing::debug!(target: LOG_TARGET, "inbound opening connection upgrade timed out: {:?}", timeout);
-                // sleep for  1 second
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                continue;
-            }
-            // Opened or Closed
-            val => {
-                break val;
-            }
-        }
-    };
-
-    let OpeningEvent::ConnectionOpened { remote_fingerprint } = event else {
-        return Err(Error::Disconnected);
-    };
-
-    let (noise_stream, drop_listener) = connection
+    let (noise_stream, drop_listener) = udp_manager
+        .lock()
+        .unwrap()
+        .opening
+        .get(&source)
+        .ok_or(Error::ConnectionDoesntExist)?
+        .clone()
         .new_stream_from_data_channel_id(noise_channel_id)
         .map_err(|_| Error::StreamCreationFailed)?;
 
@@ -120,6 +80,28 @@ pub(crate) async fn inbound(
     let client_fingerprint: crate::tokio::Fingerprint =
         config.dtls_cert().unwrap().fingerprint().into();
 
+    let remote_fingerprint: fingerprint::Fingerprint = udp_manager
+        .lock()
+        .unwrap()
+        .opening
+        .get(&source)
+        .ok_or(Error::ConnectionDoesntExist)?
+        .rtc()
+        .lock()
+        .unwrap()
+        .direct_api()
+        .remote_dtls_fingerprint()
+        .expect("remote fingerprint")
+        .clone()
+        .into();
+    //
+    // let local_fingerprint: Fingerprint = rtc
+    //     .lock()
+    //     .unwrap()
+    //     .direct_api()
+    //     .local_dtls_fingerprint()
+    //     .clone()
+    //     .into();
     let peer_id = noise::inbound(
         config.id_keys().clone(),
         noise_stream,
@@ -129,7 +111,14 @@ pub(crate) async fn inbound(
     .await
     .map_err(|_| Error::NoiseHandshakeFailed)?;
 
-    let (connection, mut notify) = connection.open(peer_id);
+    let (connection, mut notify) = udp_manager
+        .lock()
+        .unwrap()
+        .opening
+        .get(&source)
+        .ok_or(Error::ConnectionDoesntExist)?
+        .clone()
+        .open(peer_id);
 
     let mut connection_clone = connection.clone();
 
@@ -189,10 +178,10 @@ pub(crate) async fn outbound(
     // Poll the connection to make progress towards an OpeningEvent.
     let event = loop {
         match connection.poll_progress() {
-            OpeningEvent::None => {
+            WebRtcEvent::None => {
                 continue;
             }
-            OpeningEvent::Timeout { timeout } => {
+            WebRtcEvent::Timeout { timeout } => {
                 tracing::debug!(target: LOG_TARGET, "opening connection upgrade timed out: {:?}", timeout);
                 continue;
             }
@@ -203,7 +192,7 @@ pub(crate) async fn outbound(
         }
     };
 
-    let OpeningEvent::ConnectionOpened { remote_fingerprint } = event else {
+    let WebRtcEvent::ConnectionOpened = event else {
         return Err(Error::Disconnected);
     };
 
@@ -213,7 +202,7 @@ pub(crate) async fn outbound(
     let peer_id = noise::outbound(
         id_keys,
         noise_stream,
-        *remote_fingerprint,
+        remote_fingerprint,
         client_fingerprint.into(),
     )
     .await
@@ -244,47 +233,6 @@ pub(crate) async fn outbound(
         .insert(source, ConnectionContext { tx });
 
     Ok((peer_id, connection.into()))
-}
-
-/// Create RTC client and open channel for Noise handshake.
-pub(crate) fn make_rtc_client(
-    ufrag: &str,
-    pass: &str,
-    source: SocketAddr,
-    destination: SocketAddr,
-    dtls_cert: DtlsCert,
-) -> (Arc<Mutex<Rtc>>, ChannelId) {
-    let mut rtc = Rtc::builder()
-        .set_ice_lite(true)
-        .set_dtls_cert(dtls_cert)
-        .set_fingerprint_verification(false)
-        .build();
-    tracing::trace!(target: LOG_TARGET, "source: {}, destination: {}", source, destination);
-    rtc.add_local_candidate(Candidate::host(destination, Str0mProtocol::Udp).unwrap());
-    rtc.add_remote_candidate(Candidate::host(source, Str0mProtocol::Udp).unwrap());
-    rtc.direct_api()
-        .set_remote_fingerprint(fingerprint::Fingerprint::from(Fingerprint::FF).into());
-    rtc.direct_api().set_remote_ice_credentials(IceCreds {
-        ufrag: ufrag.to_owned(),
-        pass: pass.to_owned(),
-    });
-    rtc.direct_api().set_local_ice_credentials(IceCreds {
-        ufrag: ufrag.to_owned(),
-        pass: pass.to_owned(),
-    });
-    rtc.direct_api().set_ice_controlling(true);
-    rtc.direct_api().start_dtls(false).unwrap();
-    rtc.direct_api().start_sctp(false);
-
-    let noise_channel_id = rtc.direct_api().create_data_channel(ChannelConfig {
-        label: "noise".to_string(),
-        ordered: false,
-        reliability: Default::default(),
-        negotiated: Some(0),
-        protocol: "".to_string(),
-    });
-
-    (Arc::new(Mutex::new(rtc)), noise_channel_id)
 }
 
 /// Make an Rtc client for an outbound connection.
@@ -319,7 +267,7 @@ pub(crate) fn outbound_rtc_client(
         pass: ufrag.clone(),
     });
     // for ICR controlling, since we are dialing outbound we are controlling?
-    rtc.direct_api().set_ice_controlling(true);
+    rtc.direct_api().set_ice_controlling(false);
 
     // TODO: Determine if these are the right settings for outbound!!
     rtc.direct_api().start_dtls(false).unwrap();

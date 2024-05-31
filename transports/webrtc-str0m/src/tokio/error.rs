@@ -57,6 +57,10 @@ pub enum Error {
     #[error("channel doesn't exist")]
     ChannelDoesntExist,
 
+    /// Connection doesn't exist
+    #[error("connection doesn't exist")]
+    ConnectionDoesntExist,
+
     /// Lock poisoned
     #[error("lock poisoned")]
     LockPoisoned,

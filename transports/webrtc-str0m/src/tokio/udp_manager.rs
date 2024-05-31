@@ -1,13 +1,16 @@
 //! This module contains the `UDPManager` struct which is responsible for managing the UDP connections used by the WebRTC transport.
-
+use crate::tokio::fingerprint::Fingerprint;
+use crate::tokio::stream::Stream;
 use crate::tokio::{
-    connection::{Open, Opening},
+    connection::{Open, Opening, WebRtcEvent},
     error, Connection, Error,
 };
-use futures::channel::mpsc::{Receiver, Sender};
-use libp2p_core::transport::ListenerId;
-use libp2p_identity::PeerId;
+use futures::future::BoxFuture;
+use futures::FutureExt;
+use futures_timer::Delay;
 use socket2::{Domain, Socket, Type};
+use std::collections::VecDeque;
+use std::sync::Mutex;
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -16,12 +19,15 @@ use std::{
     time::Duration,
 };
 use std::{sync::Arc, time::Instant};
+use str0m::change::DtlsCert;
+use str0m::channel::{ChannelConfig, ChannelId};
 use str0m::net::Protocol as Str0mProtocol;
 use str0m::{
     ice::{IceCreds, StunMessage},
     net::{DatagramRecv, Receive},
     Input,
 };
+use str0m::{Candidate, Rtc};
 use tokio::{
     io::ReadBuf,
     net::UdpSocket,
@@ -35,12 +41,8 @@ const LOG_TARGET: &str = "libp2p_webrtc_str0m";
 const RECEIVE_MTU: usize = 8192;
 
 /// The [`SocketAddr`] of a new remote address that wants to connect on this socket.
-#[derive(Debug)]
-pub(crate) struct NewRemoteAddress {
+pub(crate) struct NewRemote {
     pub(crate) addr: SocketAddr,
-    pub(crate) ufrag: String,
-    pub(crate) pass: String,
-    pub(crate) contents: Vec<u8>,
 }
 
 /// Events emitted by the [`UDPManager`].
@@ -48,17 +50,15 @@ pub(crate) struct NewRemoteAddress {
 /// connect on ths socket. For this event, we bubble up to
 /// the [Transport](crate::tokio::transport) to handle the new remote so
 /// it can be upgraded accordingly.
-#[derive(Debug)]
 pub(crate) enum UDPManagerEvent {
     /// A new remote address wants to connect on this socket.
-    NewRemoteAddress(NewRemoteAddress),
+    NewRemoteAddress(Vec<NewRemote>),
     /// Error event.
     Error(error::Error),
 }
 
 /// A struct which handles Socket Open Connection process
-/// Initial Sender is a futures mpsc Option which is taken for Initialization,
-/// The second Sender is the regular sender to send datagrams to the Connection
+/// Initial Sender is a futures mpsc Option which is taken for Initialization, The second Sender is the regular sender to send datagrams to the Connection
 #[derive(Debug)]
 pub(crate) struct ConnectionContext {
     /// TX channel for sending datagrams to the connection event loop.
@@ -78,11 +78,17 @@ pub(crate) struct UDPManager {
 
     /// Mapping of socket addresses to Open connections we have.
     pub(crate) open: HashMap<SocketAddr, ConnectionContext>,
+
+    /// Pending timeouts
+    timeouts: HashMap<SocketAddr, BoxFuture<'static, ()>>,
+
+    /// Dtls certificate
+    dtls_cert: DtlsCert,
 }
 
 /// Whether this is a new connection that should be Polled or not.
-enum NewSource {
-    Yes(IceCreds),
+enum PollConnection {
+    Yes,
     No,
 }
 
@@ -90,7 +96,7 @@ enum NewSource {
 /// by the [`WebRtcTransport`] event loop.
 enum ConnectionEvent {
     /// Connection established.
-    ConnectionEstablished,
+    ConnectionEstablished, // { remote_fingerprint: Fingerprint },
 
     /// Connection to peer closed.
     ConnectionClosed,
@@ -109,7 +115,7 @@ impl UDPManager {
     }
 
     /// Creates a new `UDPManager` with the given address.
-    pub(crate) fn with_address(addr: SocketAddr) -> Result<Self, Error> {
+    pub(crate) fn with_config(addr: SocketAddr, dtls_cert: DtlsCert) -> Result<Self, Error> {
         let socket = match addr.is_ipv4() {
             true => {
                 let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(socket2::Protocol::UDP))?;
@@ -143,6 +149,8 @@ impl UDPManager {
             socket: Arc::new(socket),
             open: Default::default(),
             opening: Default::default(),
+            timeouts: Default::default(),
+            dtls_cert,
         })
     }
 
@@ -160,7 +168,14 @@ impl UDPManager {
     pub(crate) fn poll(&mut self, cx: &mut Context) -> Poll<UDPManagerEvent> {
         let mut this = Pin::new(self);
 
+        let mut pending_events = Vec::new();
+        let mut pending_noise_streams: HashMap<SocketAddr, Stream> = HashMap::new();
+
         loop {
+            tracing::trace!(
+                target: LOG_TARGET,
+                "Start udp manager poll loop"
+            );
             let mut buf = vec![0u8; RECEIVE_MTU];
             let mut read_buf = ReadBuf::new(&mut buf);
 
@@ -181,31 +196,119 @@ impl UDPManager {
                     buf.truncate(nread);
 
                     match this.on_socket_input(source, &buf) {
-                        Ok(NewSource::No) => { /* Existing connection, handled. */ }
-                        Ok(NewSource::Yes(ice_creds)) => {
+                        Ok(PollConnection::No) => {
+                            /* Existing connection, handled. */
                             tracing::trace!(
                                 target: LOG_TARGET,
-                                "new remote address: {} with ice creds: {:?}",
+                                "existing connection, handled: {}",
                                 source,
-                                ice_creds
                             );
-                            let ready =
-                                Poll::Ready(UDPManagerEvent::NewRemoteAddress(NewRemoteAddress {
-                                    addr: source,
-                                    ufrag: ice_creds.ufrag,
-                                    pass: ice_creds.pass,
-                                    contents: buf,
-                                }));
-                            return ready;
                         }
+                        Ok(PollConnection::Yes) => loop {
+                            tracing::trace!(
+                                target: LOG_TARGET,
+                                "Start poll connection loop"
+                            );
+                            match this.poll_connection(&source) {
+                                ConnectionEvent::ConnectionEstablished => {
+                                    tracing::trace!(
+                                        target: LOG_TARGET,
+                                        "new remote connection established: {}",
+                                        source,
+                                    );
+                                    if pending_events
+                                        .iter()
+                                        .all(|evt: &NewRemote| evt.addr != source)
+                                    {
+                                        let evt = NewRemote { addr: source };
+                                        pending_events.push(evt);
+                                    }
+                                }
+                                ConnectionEvent::ConnectionClosed => {
+                                    this.opening.remove(&source);
+                                    this.timeouts.remove(&source);
+
+                                    break;
+                                }
+                                ConnectionEvent::Timeout { duration } => {
+                                    this.timeouts.insert(
+                                        source,
+                                        Box::pin(async move { Delay::new(duration).await }),
+                                    );
+
+                                    tracing::trace!(
+                                        target: LOG_TARGET,
+                                        "poll connection loop 1 timeout: {:?}",
+                                        duration
+                                    );
+
+                                    break;
+                                }
+                            }
+                        },
                         Err(error) => {
-                            return Poll::Ready(UDPManagerEvent::Error(error));
+                            tracing::debug!(
+                                target: LOG_TARGET,
+                                ?source,
+                                ?error,
+                                "failed to handle datagram",
+                            );
+                            // return Poll::Ready(UDPManagerEvent::Error(error));
+                        }
+                    } // match
+                } // Poll::Ready(Ok(source))
+            } // match
+        } // outter loop
+
+        // go over all pending timeouts to see if any of them have expired
+        // and if any of them have, poll the connection until it registers another timeout
+        let more_pending_events = this
+            .timeouts
+            .iter_mut()
+            .filter_map(
+                |(source, mut delay)| match Pin::new(&mut delay).poll_unpin(cx) {
+                    Poll::Pending => None,
+                    Poll::Ready(_) => Some(*source),
+                },
+            )
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|source| {
+                let mut pending_event = None;
+
+                loop {
+                    match this.poll_connection(&source) {
+                        ConnectionEvent::ConnectionEstablished => {
+                            pending_event = Some(NewRemote { addr: source });
+                        }
+                        ConnectionEvent::ConnectionClosed => {
+                            this.opening.remove(&source);
+                            return None;
+                        }
+                        ConnectionEvent::Timeout { duration } => {
+                            this.timeouts.insert(
+                                source,
+                                Box::pin(async move {
+                                    Delay::new(duration);
+                                }),
+                            );
+                            break;
                         }
                     }
                 }
-            }
+
+                pending_event
+            })
+            .collect::<VecDeque<_>>();
+        // this.timeouts
+        //     .retain(|source, _| this.opening.contains_key(source));
+        pending_events.extend(more_pending_events);
+        // if no pending_events, Poll;, else, return the pending_events
+        if pending_events.is_empty() {
+            Poll::Pending
+        } else {
+            Poll::Ready(UDPManagerEvent::NewRemoteAddress(pending_events))
         }
-        Poll::Pending
     }
 
     /// Handle socket input.
@@ -220,7 +323,7 @@ impl UDPManager {
         &mut self,
         source: SocketAddr,
         buffer: &[u8],
-    ) -> Result<NewSource, error::Error> {
+    ) -> Result<PollConnection, error::Error> {
         // get the notified from the notifier in open connections
         if let Some(ConnectionContext { tx }) = self.open.get_mut(&source) {
             match tx.try_send(buffer.to_vec()) {
@@ -240,12 +343,16 @@ impl UDPManager {
                     );
                 }
             }
-            return Ok(NewSource::No);
+            return Ok(PollConnection::No);
         }
 
         if buffer.is_empty() {
             return Err(Error::InvalidData);
         }
+
+        // if the peer doesn't exist, decode the message and expect to receive `Stun`
+        // so that a new connection can be initialized
+        let contents: DatagramRecv = buffer.try_into().map_err(|_| Error::InvalidData)?;
 
         // 2) Otherwise we haven't seen this source address before, it should be Stun, and we return the ICE creds (ufrag, pass)
         match StunMessage::parse(buffer) {
@@ -264,10 +371,32 @@ impl UDPManager {
                     pass
                 );
 
-                Ok(NewSource::Yes(IceCreds {
-                    ufrag: ufrag.to_owned(),
-                    pass: pass.to_owned(),
-                }))
+                let destination = self.listen_addr;
+
+                // Create new `Rtc` object for this source
+                let rtc =
+                    make_rtc_client(ufrag, ufrag, source, destination, self.dtls_cert.clone());
+                // Cast the datagram into a str0m::Receive and pass it to the str0m client
+                rtc.lock()
+                    .map_err(|_| Error::LockPoisoned)?
+                    .handle_input(Input::Receive(
+                        Instant::now(),
+                        Receive {
+                            source,
+                            proto: Str0mProtocol::Udp,
+                            destination,
+                            contents,
+                        },
+                    ))?;
+
+                // make the connecton and insert it into self.opening
+                // New Opening Connection
+                let connection = Connection::new(rtc.clone(), destination, self.socket(), source);
+
+                // A relay tp this new Open Connection needs to be added to udp_manager
+                self.opening.insert(source, connection);
+
+                Ok(PollConnection::Yes)
             }
             Err(err) => {
                 tracing::warn!(
@@ -321,15 +450,111 @@ impl UDPManager {
                     }
                 }
 
-                Ok(NewSource::No)
+                tracing::trace!(
+                    target: LOG_TARGET,
+                    "Returning PollCOnnection::YES for source: {}",
+                    source,
+                );
+
+                Ok(PollConnection::Yes)
             }
         }
     }
 
     /// Poll opening connection.
     fn poll_connection(&mut self, source: &SocketAddr) -> ConnectionEvent {
-        todo!()
+        let Some(connection) = self.opening.get_mut(source) else {
+            tracing::warn!(
+                target: LOG_TARGET,
+                ?source,
+                "connection doesn't exist",
+            );
+            return ConnectionEvent::ConnectionClosed;
+        };
+
+        loop {
+            match connection.poll_progress() {
+                WebRtcEvent::Timeout { timeout } => {
+                    let duration = timeout - Instant::now();
+
+                    match duration.is_zero() {
+                        true => match connection.on_timeout() {
+                            Ok(()) => continue,
+                            Err(error) => {
+                                tracing::debug!(
+                                    target: LOG_TARGET,
+                                    ?source,
+                                    ?error,
+                                    "failed to handle timeout",
+                                );
+
+                                return ConnectionEvent::ConnectionClosed;
+                            }
+                        },
+                        false => return ConnectionEvent::Timeout { duration },
+                    }
+                }
+                WebRtcEvent::Transmit {
+                    destination,
+                    datagram,
+                } => {
+                    if let Err(error) = self.socket.try_send_to(&datagram, destination) {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            ?source,
+                            ?error,
+                            "failed to send datagram",
+                        );
+                    }
+                }
+                WebRtcEvent::ConnectionClosed => return ConnectionEvent::ConnectionClosed,
+                WebRtcEvent::ConnectionOpened => return ConnectionEvent::ConnectionEstablished,
+                _ => {}
+            }
+        }
     }
+}
+
+/// Create RTC client and open channel for Noise handshake.
+pub(crate) fn make_rtc_client(
+    ufrag: &str,
+    pass: &str,
+    source: SocketAddr,
+    destination: SocketAddr,
+    dtls_cert: DtlsCert,
+) -> Arc<Mutex<Rtc>> {
+    let mut rtc = Rtc::builder()
+        .set_ice_lite(true)
+        .set_dtls_cert(dtls_cert)
+        .set_fingerprint_verification(false)
+        .build();
+    tracing::trace!(target: LOG_TARGET, "source: {}, destination: {}", source, destination);
+    rtc.add_local_candidate(Candidate::host(destination, Str0mProtocol::Udp).unwrap());
+    rtc.add_remote_candidate(Candidate::host(source, Str0mProtocol::Udp).unwrap());
+    rtc.direct_api()
+        .set_remote_fingerprint(Fingerprint::from(libp2p_webrtc_utils::Fingerprint::FF).into());
+    rtc.direct_api().set_remote_ice_credentials(IceCreds {
+        ufrag: ufrag.to_owned(),
+        pass: pass.to_owned(),
+    });
+    rtc.direct_api().set_local_ice_credentials(IceCreds {
+        ufrag: ufrag.to_owned(),
+        pass: pass.to_owned(),
+    });
+    rtc.direct_api().set_ice_controlling(false);
+    rtc.direct_api().start_dtls(false).unwrap();
+    rtc.direct_api().start_sctp(false);
+
+    // let noise_channel_id = rtc.direct_api().create_data_channel(ChannelConfig {
+    //     label: "noise".to_string(),
+    //     ordered: false,
+    //     reliability: Default::default(),
+    //     negotiated: Some(0),
+    //     protocol: "".to_string(),
+    // });
+
+    // (Arc::new(Mutex::new(rtc)), noise_channel_id)
+    Arc::new(Mutex::new(rtc))
 }
 
 fn is_stun_packet(bytes: &[u8]) -> bool {

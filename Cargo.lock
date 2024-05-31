@@ -3544,6 +3544,7 @@ name = "libp2p-webrtc-str0m"
 version = "0.1.0-alpha"
 dependencies = [
  "futures",
+ "futures-timer",
  "if-watch",
  "libp2p-core",
  "libp2p-identity",

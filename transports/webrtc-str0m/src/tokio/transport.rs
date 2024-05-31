@@ -7,6 +7,7 @@ use futures::Stream;
 use if_watch::tokio::IfWatcher;
 use if_watch::IfEvent;
 use libp2p_core::multiaddr::Protocol;
+use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -75,7 +76,7 @@ impl libp2p_core::Transport for Transport {
         tracing::debug!("Listening on {:?}", addr);
 
         let udp_manager = Arc::new(Mutex::new(
-            UDPManager::with_address(addr)
+            UDPManager::with_config(addr, self.config.inner.dtls_cert().unwrap().clone())
                 .map_err(|_e| TransportError::Other(Error::Disconnected))?,
         ));
 
@@ -105,7 +106,7 @@ impl libp2p_core::Transport for Transport {
         let client_fingerprint = self.config.fingerprint;
 
         let upd_manager = Arc::new(Mutex::new(
-            UDPManager::with_address(sock_addr)
+            UDPManager::with_config(sock_addr, config.inner.dtls_cert().unwrap().clone())
                 .map_err(|e| TransportError::Other(Error::Disconnected))?,
         ));
 
@@ -184,7 +185,7 @@ struct ListenStream {
 
     /// Pending event to reported. In our case, if a Item = [TransportEvent::NewAddress] event
     /// occurs,
-    pending_events: Option<<Self as Stream>::Item>,
+    pending_events: VecDeque<<Self as Stream>::Item>,
 
     /// The stream must be awaken after it has been closed to deliver the last event.
     close_listener_waker: Option<Waker>,
@@ -199,16 +200,15 @@ impl ListenStream {
     ) -> io::Result<Self> {
         let listen_addr = udp_manager.lock().unwrap().listen_addr();
         let if_watcher;
-        let pending_event;
+        let mut pending_events = VecDeque::new();
         if listen_addr.ip().is_unspecified() {
             tracing::debug!("Listening on all interfaces (0.0.0.0), starting IfWatcher");
             if_watcher = Some(IfWatcher::new()?);
-            pending_event = None;
         } else {
             tracing::debug!("Listening on {:?}. No IfWatcher started", listen_addr);
             if_watcher = None;
             let ma = socketaddr_to_multiaddr(&listen_addr, Some(config.fingerprint));
-            pending_event = Some(TransportEvent::NewAddress {
+            pending_events.push_back(TransportEvent::NewAddress {
                 listener_id,
                 listen_addr: ma,
             })
@@ -221,7 +221,7 @@ impl ListenStream {
             udp_manager,
             report_closed: None,
             if_watcher,
-            pending_events: pending_event,
+            pending_events,
             close_listener_waker: None,
         })
     }
@@ -304,42 +304,43 @@ impl ListenStream {
 impl Stream for ListenStream {
     type Item = TransportEvent<<Transport as libp2p_core::Transport>::ListenerUpgrade, Error>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = Pin::into_inner(self);
         loop {
             // If a [TransportEvent::NewAddress] event is pending, return it.
-            if let Some(event) = self.pending_events.take() {
+            if let Some(event) = this.pending_events.pop_front() {
                 return Poll::Ready(Some(event));
             }
             // If a Listener has been closed
-            if let Some(closed) = self.report_closed.as_mut() {
+            if let Some(closed) = this.report_closed.as_mut() {
                 // Listener was closed.
                 // Report the transport event if there is one. On the next iteration, return
                 // `Poll::Ready(None)` to terminate the stream.
                 return Poll::Ready(closed.take());
             }
-            if let Poll::Ready(event) = self.poll_if_watcher(cx) {
+            if let Poll::Ready(event) = this.poll_if_watcher(cx) {
                 tracing::debug!("IfWatcher event: {:?}", event);
 
                 if let TransportEvent::NewAddress {
                     ref listen_addr, ..
                 } = event
                 {
-                    // if not loopback, set self.listen_addr to the first non-loopback value
+                    // if not loopback, set this.listen_addr to the first non-loopback value
                     match listen_addr.iter().next() {
                         Some(Protocol::Ip4(ip)) => {
                             if !ip.is_loopback()
                                 && !ip.is_unspecified()
                                 && !ip.is_link_local()
                                 && !ip.is_multicast()
-                                && self.listen_addr.ip().is_unspecified()
+                                && this.listen_addr.ip().is_unspecified()
                             {
-                                self.listen_addr =
-                                    SocketAddr::new(IpAddr::V4(ip), self.listen_addr.port());
-                                self.udp_manager
+                                this.listen_addr =
+                                    SocketAddr::new(IpAddr::V4(ip), this.listen_addr.port());
+                                this.udp_manager
                                     .lock()
                                     .unwrap()
-                                    .set_listen_addr(self.listen_addr);
-                                tracing::debug!("New listen_addr set to: {:?}", self.listen_addr);
+                                    .set_listen_addr(this.listen_addr);
+                                tracing::debug!("New listen_addr set to: {:?}", this.listen_addr);
                             }
                         }
                         Some(Protocol::Ip6(ip6)) => {
@@ -347,11 +348,11 @@ impl Stream for ListenStream {
                                 && !ip6.is_unspecified()
                                 // && !ip6.is_unicast_link_local()
                                 && !ip6.is_multicast()
-                                && self.listen_addr.ip().is_unspecified()
+                                && this.listen_addr.ip().is_unspecified()
                             {
-                                self.listen_addr =
-                                    SocketAddr::new(IpAddr::V6(ip6), self.listen_addr.port());
-                                tracing::debug!("New listen_addr set to: {:?}", self.listen_addr);
+                                this.listen_addr =
+                                    SocketAddr::new(IpAddr::V6(ip6), this.listen_addr.port());
+                                tracing::debug!("New listen_addr set to: {:?}", this.listen_addr);
                             }
                         }
                         _ => {}
@@ -361,42 +362,51 @@ impl Stream for ListenStream {
                 return Poll::Ready(Some(event));
             }
 
-            let mut udp = self.udp_manager.lock().unwrap();
+            let mut udp = this.udp_manager.lock().unwrap();
 
             // UDP Manager will only bubble up new addresses for tracking, and
             // errors for closing. All other UDP Events are handled internally
             // within the upgraded connection.
             match udp.poll(cx) {
-                Poll::Ready(UDPManagerEvent::NewRemoteAddress(remote)) => {
-                    let local_addr =
-                        socketaddr_to_multiaddr(&self.listen_addr, Some(self.config.fingerprint));
-                    let send_back_addr = socketaddr_to_multiaddr(&remote.addr, None);
+                Poll::Ready(UDPManagerEvent::NewRemoteAddress(remotes)) => {
+                    for remote in remotes {
+                        let local_addr = socketaddr_to_multiaddr(
+                            &this.listen_addr,
+                            Some(this.config.fingerprint),
+                        );
+                        let send_back_addr = socketaddr_to_multiaddr(&remote.addr, None);
 
-                    let upgrade = upgrade::inbound(
-                        remote, //.addr,
-                        self.listen_addr,
-                        self.config.clone(),
-                        self.udp_manager.clone(),
-                    )
-                    .boxed();
+                        let upgrade = upgrade::inbound(
+                            remote,
+                            this.listen_addr,
+                            this.config.clone(),
+                            this.udp_manager.clone(),
+                        )
+                        .boxed();
 
-                    return Poll::Ready(Some(TransportEvent::Incoming {
-                        upgrade,
-                        local_addr,
-                        send_back_addr,
-                        listener_id: self.listener_id,
-                    }));
+                        let evt = TransportEvent::Incoming {
+                            upgrade,
+                            local_addr,
+                            send_back_addr,
+                            listener_id: this.listener_id,
+                        };
+                        this.pending_events.push_back(evt);
+                    }
+                    break;
                 }
                 Poll::Ready(UDPManagerEvent::Error(err)) => {
                     tracing::error!("Error in UDPManager: {:?}", err);
                     drop(udp);
-                    self.close(Err(err));
+                    this.close(Err(err));
                     continue;
                 }
                 Poll::Pending => {}
             }
             return Poll::Pending;
-        }
+        } // loop
+        this.pending_events
+            .pop_front()
+            .map_or(Poll::Pending, |event| Poll::Ready(Some(event)))
     }
 }
 

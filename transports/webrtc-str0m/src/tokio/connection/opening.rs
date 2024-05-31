@@ -8,7 +8,7 @@ use super::*;
 #[derive(Debug, Clone)]
 pub struct Opening {
     /// The state of the opening connection handshake
-    handshake_state: HandshakeState,
+    state: State,
 }
 
 impl Default for Opening {
@@ -21,7 +21,7 @@ impl Opening {
     /// Creates a new `Opening` state.
     pub fn new() -> Self {
         Self {
-            handshake_state: HandshakeState::Closed,
+            state: State::Closed,
         }
     }
 
@@ -105,7 +105,7 @@ impl Connection<Opening> {
 }
 
 impl Connectable for Opening {
-    type Output = OpeningEvent;
+    type Output = WebRtcEvent;
 
     /// Handle error for Opening connection.
     fn on_rtc_error(&mut self, error: str0m::RtcError) -> Self::Output {
@@ -114,7 +114,7 @@ impl Connectable for Opening {
             ?error,
             "WebRTC connection error",
         );
-        OpeningEvent::ConnectionClosed
+        WebRtcEvent::ConnectionClosed
     }
 
     /// Return [WebRtcEvent::Timeout] when an error occurs while [`Opening`].
@@ -139,26 +139,26 @@ impl Connectable for Opening {
                     );
 
                     rtc.lock().unwrap().disconnect();
-                    return OpeningEvent::ConnectionClosed;
+                    return WebRtcEvent::ConnectionClosed;
                 }
 
-                OpeningEvent::None
+                WebRtcEvent::None
             }
-            false => OpeningEvent::Timeout { timeout },
+            false => WebRtcEvent::Timeout { timeout },
         }
     }
 
     /// If ICE Connection State is Disconnected, return [WebRtcEvent::ConnectionClosed].
     fn on_event_ice_disconnect(&self) -> Self::Output {
         tracing::trace!(target: LOG_TARGET, "ice connection closed");
-        OpeningEvent::ConnectionClosed
+        WebRtcEvent::ConnectionClosed
     }
 
     /// Progress the opening of the channel, as applicable.
     fn on_event_channel_open(&mut self, _channel_id: ChannelId, _name: String) -> Self::Output {
         // No Opening specific logic for channel open
 
-        OpeningEvent::None
+        WebRtcEvent::None
     }
 
     fn on_event_channel_close(&mut self, _channel_id: ChannelId) -> Self::Output {
@@ -176,29 +176,35 @@ impl Connectable for Opening {
             // connection_id = ?self.connection_id,
             "opening Noise connection established",
         );
-        match std::mem::replace(&mut self.handshake_state, HandshakeState::Poisoned) {
+        match std::mem::replace(&mut self.state, State::Poisoned) {
             // Initial State should be Closed before we connect
-            HandshakeState::Closed => {
-                let remote_fp: Fingerprint = rtc
-                    .lock()
-                    .unwrap()
-                    .direct_api()
-                    .remote_dtls_fingerprint()
-                    .clone()
-                    .expect("fingerprint to exist")
-                    .into();
-
+            State::Closed => {
+                // let remote_fingerprint: Fingerprint = rtc
+                //     .lock()
+                //     .unwrap()
+                //     .direct_api()
+                //     .remote_dtls_fingerprint()
+                //     .clone()
+                //     .expect("fingerprint to exist")
+                //     .into();
+                //
+                // let local_fingerprint: Fingerprint = rtc
+                //     .lock()
+                //     .unwrap()
+                //     .direct_api()
+                //     .local_dtls_fingerprint()
+                //     .clone()
+                //     .into();
+                //
                 tracing::debug!(
                     target: LOG_TARGET,
                     // peer = ?self.peer_address,
                     "connection opened",
                 );
 
-                self.handshake_state = HandshakeState::Opened;
+                self.state = State::Opened;
 
-                OpeningEvent::ConnectionOpened {
-                    remote_fingerprint: remote_fp,
-                }
+                WebRtcEvent::ConnectionOpened // { remote_fingerprint }
             }
             state => {
                 tracing::warn!(
@@ -208,7 +214,7 @@ impl Connectable for Opening {
                     "unexpected handshake state, invalid state for connection, should be closed",
                 );
 
-                OpeningEvent::ConnectionClosed
+                WebRtcEvent::ConnectionClosed
             }
         }
     }
