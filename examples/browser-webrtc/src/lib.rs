@@ -21,12 +21,17 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
         ping_duration
     ))?;
 
+    // print startign time
+    body.append_p(&format!("Starting at {}", Date::new_0().to_string()))?;
+
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_wasm_bindgen()
         .with_other_transport(|key| {
             webrtc_websys::Transport::new(webrtc_websys::Config::new(&key))
         })?
-        .with_behaviour(|_| ping::Behaviour::new(ping::Config::new()))?
+        .with_behaviour(|_| {
+            ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(1)))
+        })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(ping_duration))
         .build();
 
@@ -46,7 +51,7 @@ pub async fn run(libp2p_endpoint: String) -> Result<(), JsError> {
                 result: Ok(rtt),
                 ..
             }) => {
-                tracing::info!("Ping successful: RTT: {rtt:?}, from {peer}");
+                tracing::info!("🏓 Ping successful: RTT: {rtt:?}, from {peer}");
                 body.append_p(&format!("RTT: {rtt:?} at {}", Date::new_0().to_string()))?;
             }
             SwarmEvent::ConnectionClosed {

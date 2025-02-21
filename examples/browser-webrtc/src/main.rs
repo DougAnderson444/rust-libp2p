@@ -1,6 +1,9 @@
 #![allow(non_upper_case_globals)]
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
 use anyhow::Result;
 use axum::{
@@ -24,9 +27,11 @@ use tower_http::cors::{Any, CorsLayer};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("browser_webrtc_example=debug,libp2p_webrtc=info,libp2p_ping=debug")
-        .try_init();
+    if let Err(e)  = tracing_subscriber::fmt()
+        .with_env_filter("browser_webrtc_example=debug,libp2p_webrtc=debug,libp2p_webrtc_utils=debug,libp2p_ping=debug,webrtc=debug,webrtc_data=debug,libp2p_noise=trace,webrtc_sctp=off")
+        .try_init() {
+        eprintln!("Failed to initialize tracing: {:?}", e);
+    }
 
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
@@ -37,7 +42,10 @@ async fn main() -> anyhow::Result<()> {
             )
             .map(|(peer_id, conn), _| (peer_id, StreamMuxerBox::new(conn))))
         })?
-        .with_behaviour(|_| ping::Behaviour::default())?
+        .with_behaviour(|_| {
+            ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(1)))
+        })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
         .build();
 
     let address_webrtc = Multiaddr::from(Ipv4Addr::UNSPECIFIED)
@@ -105,16 +113,20 @@ pub(crate) async fn serve(libp2p_transport: Multiaddr) {
                 .allow_methods([Method::GET]),
         );
 
-    let addr = SocketAddr::new(listen_addr.into(), 8080);
+    let port = 8081;
+    let addr = SocketAddr::new(listen_addr.into(), port);
 
     tracing::info!(url=%format!("http://{addr}"), "Serving client files at url");
-
-    axum::serve(
-        TcpListener::bind((listen_addr, 8080)).await.unwrap(),
-        server.into_make_service(),
-    )
-    .await
-    .unwrap();
+    match TcpListener::bind((listen_addr, port)).await {
+        Ok(listener) => {
+            if let Err(e) = axum::serve(listener, server.into_make_service()).await {
+                tracing::error!(error=%e, "Failed to serve HTTP server");
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to bind to address {:?}", e);
+        }
+    }
 }
 
 #[derive(Clone)]
