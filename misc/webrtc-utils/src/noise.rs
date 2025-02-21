@@ -69,7 +69,9 @@ where
     // send application data 0.5 RTT earlier.
     let (peer_id, mut channel) = noise.upgrade_inbound(stream, info).await?;
 
-    channel.close().await?;
+    // We can't `channel.close().await?` from both sides at the same time,
+    // so we let the inbound side close the channel. Here we can let the channel drop
+    // without close, because the inbound side will close the channel.
 
     Ok(peer_id)
 }
