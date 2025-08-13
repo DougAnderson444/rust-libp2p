@@ -82,6 +82,10 @@ impl PreSharedKey {
             .expect("shake128 failed");
         Fingerprint(out)
     }
+
+    pub fn as_bytes(&self) -> [u8; 32] {
+        self.0
+    }
 }
 
 fn parse_hex_key(s: &str) -> Result<[u8; KEY_SIZE], KeyParseError> {
