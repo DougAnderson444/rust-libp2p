@@ -83,7 +83,7 @@ impl PreSharedKey {
         Fingerprint(out)
     }
 
-    pub fn as_bytes(&self) -> [u8; 32] {
+    pub fn as_bytes(&self) -> [u8; KEY_SIZE] {
         self.0
     }
 }
