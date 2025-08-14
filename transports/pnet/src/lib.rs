@@ -92,8 +92,8 @@ impl PreSharedKey {
         Fingerprint(out)
     }
 
-    pub fn as_bytes(&self) -> [u8; KEY_SIZE] {
-        self.0
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
     }
 }
 
