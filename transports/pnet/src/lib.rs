@@ -46,6 +46,7 @@ use salsa20::{
     Salsa20, XSalsa20,
 };
 use sha3::{digest::ExtendableOutput, Shake128};
+use std::ops::Deref;
 
 const KEY_SIZE: usize = 32;
 const NONCE_SIZE: usize = 24;
@@ -55,6 +56,14 @@ const FINGERPRINT_SIZE: usize = 16;
 /// A pre-shared key, consisting of 32 bytes of random data.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct PreSharedKey([u8; KEY_SIZE]);
+
+impl Deref for PreSharedKey {
+    type Target = [u8; KEY_SIZE];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl PreSharedKey {
     /// Create a new pre shared key from raw bytes
@@ -81,6 +90,10 @@ impl PreSharedKey {
             .read_exact(&mut out)
             .expect("shake128 failed");
         Fingerprint(out)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
     }
 }
 
