@@ -3168,6 +3168,7 @@ dependencies = [
  "quickcheck-ext",
  "rand 0.8.5",
  "salsa20",
+ "serde",
  "sha3",
  "tokio",
  "tracing",

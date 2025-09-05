@@ -12,48 +12,54 @@ categories = ["network-programming", "asynchronous"]
 
 [features]
 full = [
-    "async-std",
-    "autonat",
-    "cbor",
-    "dcutr",
-    "dns",
-    "ecdsa",
-    "ed25519",
-    "floodsub",
-    "gossipsub",
-    "identify",
-    "json",
-    "kad",
-    "macros",
-    "mdns",
-    "memory-connection-limits",
-    "metrics",
-    "noise",
-    "peer-store",
-    "ping",
-    "plaintext",
-    "pnet",
-    "quic",
-    "relay",
-    "rendezvous",
-    "request-response",
-    "rsa",
-    "secp256k1",
-    "serde",
-    "tcp",
-    "tls",
-    "tokio",
-    "uds",
-    "wasm-bindgen",
-    "webrtc-websys",
-    "websocket-websys",
-    "websocket",
-    "webtransport-websys",
-    "yamux",
-    "upnp",
+  "async-std",
+  "autonat",
+  "cbor",
+  "dcutr",
+  "dns",
+  "ecdsa",
+  "ed25519",
+  "floodsub",
+  "gossipsub",
+  "identify",
+  "json",
+  "kad",
+  "macros",
+  "mdns",
+  "memory-connection-limits",
+  "metrics",
+  "noise",
+  "peer-store",
+  "ping",
+  "plaintext",
+  "pnet",
+  "quic",
+  "relay",
+  "rendezvous",
+  "request-response",
+  "rsa",
+  "secp256k1",
+  "serde",
+  "tcp",
+  "tls",
+  "tokio",
+  "uds",
+  "wasm-bindgen",
+  "webrtc-websys",
+  "websocket-websys",
+  "websocket",
+  "webtransport-websys",
+  "yamux",
+  "upnp",
 ]
 
-async-std = [ "libp2p-swarm/async-std", "libp2p-mdns?/async-io", "libp2p-tcp?/async-io", "libp2p-dns?/async-std", "libp2p-quic?/async-std",]
+async-std = [
+  "libp2p-swarm/async-std",
+  "libp2p-mdns?/async-io",
+  "libp2p-tcp?/async-io",
+  "libp2p-dns?/async-std",
+  "libp2p-quic?/async-std",
+]
 autonat = ["dep:libp2p-autonat"]
 cbor = ["libp2p-request-response?/cbor"]
 dcutr = ["dep:libp2p-dcutr", "libp2p-metrics?/dcutr"]
@@ -83,9 +89,21 @@ secp256k1 = ["libp2p-identity/secp256k1"]
 serde = ["libp2p-core/serde", "libp2p-kad?/serde", "libp2p-gossipsub?/serde"]
 tcp = ["dep:libp2p-tcp"]
 tls = ["dep:libp2p-tls"]
-tokio = [ "libp2p-swarm/tokio", "libp2p-mdns?/tokio", "libp2p-tcp?/tokio", "libp2p-dns?/tokio", "libp2p-quic?/tokio", "libp2p-upnp?/tokio"]
+tokio = [
+  "libp2p-swarm/tokio",
+  "libp2p-mdns?/tokio",
+  "libp2p-tcp?/tokio",
+  "libp2p-dns?/tokio",
+  "libp2p-quic?/tokio",
+  "libp2p-upnp?/tokio",
+]
 uds = ["dep:libp2p-uds"]
-wasm-bindgen = [ "futures-timer/wasm-bindgen", "getrandom/js", "libp2p-swarm/wasm-bindgen", "libp2p-gossipsub?/wasm-bindgen"]
+wasm-bindgen = [
+  "futures-timer/wasm-bindgen",
+  "getrandom/js",
+  "libp2p-swarm/wasm-bindgen",
+  "libp2p-gossipsub?/wasm-bindgen",
+]
 webrtc-websys = ['dep:libp2p-webrtc-websys']
 websocket-websys = ["dep:libp2p-websocket-websys"]
 websocket = ["dep:libp2p-websocket"]
@@ -97,7 +115,7 @@ upnp = ["dep:libp2p-upnp"]
 bytes = "1"
 either = "1.9.0"
 futures = { workspace = true }
-futures-timer = "3.0.2" # Explicit dependency to be used in `wasm-bindgen` feature
+futures-timer = "3.0.2"          # Explicit dependency to be used in `wasm-bindgen` feature
 getrandom = { workspace = true } # Explicit dependency to be used in `wasm-bindgen` feature
 # TODO feature flag?
 rw-stream-sink = { workspace = true }
@@ -144,7 +162,13 @@ libp2p-websocket = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-std = { version = "1.6.2", features = ["attributes"] }
-tokio = { workspace = true, features = [ "io-util", "io-std", "macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = [
+  "io-util",
+  "io-std",
+  "macros",
+  "rt",
+  "rt-multi-thread",
+] }
 
 libp2p-mplex = { workspace = true }
 libp2p-tcp = { workspace = true, features = ["tokio"] }

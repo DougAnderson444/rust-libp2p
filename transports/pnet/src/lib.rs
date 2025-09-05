@@ -48,6 +48,9 @@ use salsa20::{
 use sha3::{digest::ExtendableOutput, Shake128};
 use std::ops::Deref;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 const KEY_SIZE: usize = 32;
 const NONCE_SIZE: usize = 24;
 const WRITE_BUFFER_SIZE: usize = 1024;
@@ -159,11 +162,17 @@ impl fmt::Display for PreSharedKey {
 }
 
 /// A PreSharedKey fingerprint computed from a PreSharedKey
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct Fingerprint([u8; FINGERPRINT_SIZE]);
 
 /// Dumps the fingerprint as hex
 impl fmt::Display for Fingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", to_hex(&self.0))
+    }
+}
+impl fmt::Debug for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", to_hex(&self.0))
     }

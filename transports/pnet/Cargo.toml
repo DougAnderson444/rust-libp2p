@@ -17,17 +17,28 @@ sha3 = "0.10"
 tracing = { workspace = true }
 rand = "0.8"
 pin-project = "1.1.5"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 libp2p-core = { workspace = true }
-libp2p-identity = { workspace = true, features = ["ed25519", "rsa", "ecdsa","secp256k1", "rand"] }
+libp2p-identity = { workspace = true, features = [
+  "ed25519",
+  "rsa",
+  "ecdsa",
+  "secp256k1",
+  "rand",
+] }
 libp2p-noise = { workspace = true }
 libp2p-swarm = { workspace = true, features = ["tokio"] }
 libp2p-tcp = { workspace = true, features = ["tokio"] }
 libp2p-websocket = { workspace = true }
 libp2p-yamux = { workspace = true }
 quickcheck = { workspace = true }
+serde = { version = "1", features = ["derive"] }
 tokio = { workspace = true, features = ["full"] }
+
+[features]
+serde = []
 
 # Passing arguments to the docsrs builder in order to properly document cfg's.
 # More information: https://docs.rs/about/builds#cross-compiling
