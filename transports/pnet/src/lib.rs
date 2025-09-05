@@ -164,7 +164,9 @@ impl fmt::Display for PreSharedKey {
 /// A PreSharedKey fingerprint computed from a PreSharedKey
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Copy, Clone, PartialEq, Eq)]
-pub struct Fingerprint([u8; FINGERPRINT_SIZE]);
+pub struct Fingerprint(
+    #[cfg_attr(feature = "serde", serde(with = "hex::serde"))] [u8; FINGERPRINT_SIZE],
+);
 
 /// Dumps the fingerprint as hex
 impl fmt::Display for Fingerprint {
