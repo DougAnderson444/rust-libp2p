@@ -86,7 +86,12 @@ rendezvous = ["dep:libp2p-rendezvous"]
 request-response = ["dep:libp2p-request-response"]
 rsa = ["libp2p-identity/rsa"]
 secp256k1 = ["libp2p-identity/secp256k1"]
-serde = ["libp2p-core/serde", "libp2p-kad?/serde", "libp2p-gossipsub?/serde"]
+serde = [
+  "libp2p-core/serde",
+  "libp2p-kad?/serde",
+  "libp2p-gossipsub?/serde",
+  "libp2p-pnet?/serde",
+]
 tcp = ["dep:libp2p-tcp"]
 tls = ["dep:libp2p-tls"]
 tokio = [
