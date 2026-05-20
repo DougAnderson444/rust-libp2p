@@ -168,6 +168,13 @@ pub(crate) mod native {
             Ok(conn.blpop(key, timeout as f64).await?)
         }
 
+        /// Remove `key` so manual runs do not consume a stale `listenerAddr` left in Redis.
+        pub(crate) async fn del(&self, key: &str) -> Result<()> {
+            let mut conn = self.0.get_async_connection().await?;
+            let _: () = conn.del(key).await?;
+            Ok(())
+        }
+
         pub(crate) async fn rpush(&self, key: &str, value: String) -> Result<()> {
             let mut conn = self.0.get_async_connection().await?;
             conn.rpush(key, value).await.map_err(Into::into)
@@ -282,20 +289,30 @@ pub(crate) mod wasm {
         }
 
         pub(crate) async fn blpop(&self, key: &str, timeout: u64) -> Result<Vec<String>> {
+            let url = format!("http://{}/blpop", self.0);
             let res = reqwest::Client::new()
-                .post(&format!("http://{}/blpop", self.0))
+                .post(&url)
                 .json(&BlpopRequest {
                     key: key.to_owned(),
                     timeout,
                 })
                 .send()
-                .await?
-                .json()
                 .await?;
+            let status = res.status();
+            if !status.is_success() {
+                let body = res.text().await.unwrap_or_default();
+                tracing::warn!(%status, %body, "WASM: blpop HTTP error");
+                anyhow::bail!("blpop proxy returned {status}: {body}");
+            }
+            let res: Vec<String> = res.json().await?;
             Ok(res)
         }
 
         pub(crate) async fn rpush(&self, _: &str, _: String) -> Result<()> {
+            bail!("unimplemented")
+        }
+
+        pub(crate) async fn del(&self, _: &str) -> Result<()> {
             bail!("unimplemented")
         }
     }

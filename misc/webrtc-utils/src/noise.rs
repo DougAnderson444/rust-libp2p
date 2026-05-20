@@ -67,9 +67,7 @@ where
     let info = noise.protocol_info().next().unwrap();
     // Note the roles are reversed because it allows the server (webrtc connection responder) to
     // send application data 0.5 RTT earlier.
-    let (peer_id, mut channel) = noise.upgrade_inbound(stream, info).await?;
-
-    channel.close().await?;
+    let (peer_id, _channel) = noise.upgrade_inbound(stream, info).await?;
 
     Ok(peer_id)
 }

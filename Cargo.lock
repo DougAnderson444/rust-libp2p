@@ -2455,6 +2455,7 @@ dependencies = [
  "console_error_panic_hook",
  "futures",
  "futures-timer",
+ "getrandom 0.3.2",
  "libp2p",
  "libp2p-mplex",
  "libp2p-noise",

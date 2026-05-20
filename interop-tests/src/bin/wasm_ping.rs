@@ -20,7 +20,7 @@ use tokio::{
     sync::mpsc,
 };
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*, EnvFilter};
 
 mod config;
 
@@ -42,10 +42,17 @@ struct TestState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // start logging
+    // When `RUST_LOG` is unset, `from_default_env()` only enables `error!`, which hides
+    // progress from this host-side harness. Default to `info` unless the user opted in.
+    let env_filter = match std::env::var_os("RUST_LOG") {
+        Some(_) => EnvFilter::try_from_default_env().context("invalid `RUST_LOG` filter")?,
+        None => EnvFilter::builder()
+            .with_default_directive(LevelFilter::INFO.into())
+            .parse_lossy("interop_tests=info,tower_http=warn,hyper=warn"),
+    };
     tracing_subscriber::registry()
         .with(fmt::layer())
-        .with(EnvFilter::from_default_env())
+        .with(env_filter)
         .init();
 
     // read env variables
@@ -79,7 +86,10 @@ async fn main() -> Result<()> {
         .with_state(state);
 
     // Run the service in background
-    tokio::spawn(axum::serve(TcpListener::bind(BIND_ADDR).await?, app).into_future());
+    let listener = TcpListener::bind(BIND_ADDR)
+        .await
+        .with_context(|| format!("bind HTTP harness on {BIND_ADDR}"))?;
+    tokio::spawn(axum::serve(listener, app).into_future());
 
     // Start executing the test in a browser
     let (mut chrome, driver) = open_in_browser().await?;
@@ -89,6 +99,7 @@ async fn main() -> Result<()> {
         Ok(received) => received.unwrap_or(Err("Results channel closed".to_owned())),
         Err(_) => Err("Test timed out".to_owned()),
     };
+
 
     // Close the browser after we got the results
     driver.quit().await?;
@@ -114,7 +125,8 @@ async fn open_in_browser() -> Result<(Child, WebDriver)> {
     let mut chrome = tokio::process::Command::new(chromedriver)
         .arg("--port=45782")
         .stdout(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .with_context(|| format!("failed to spawn `{chromedriver}` (is it installed and on PATH?)"))?;
     // read driver's stdout
     let driver_out = chrome
         .stdout
@@ -123,8 +135,11 @@ async fn open_in_browser() -> Result<(Child, WebDriver)> {
     // wait for the 'ready' message
     let mut reader = BufReader::new(driver_out).lines();
     while let Some(line) = reader.next_line().await? {
-        if line.contains("ChromeDriver was started successfully.") {
-            break;
+        tracing::debug!(chromedriver_stdout = %line, "chromedriver log line");
+        // Match several ChromeDriver versions: older lines ended with "successfully.";
+        // newer builds say "successfully on port …" (no period right after "successfully").
+        if line.contains("ChromeDriver was started successfully") {
+                    break;
         }
     }
 
@@ -151,7 +166,7 @@ async fn redis_blpop(
         tracing::warn!("Failed to connect to redis: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    let res = conn
+    let res: Vec<String> = conn
         .blpop(&request.key, request.timeout as f64)
         .await
         .map_err(|e| {
@@ -162,7 +177,6 @@ async fn redis_blpop(
             );
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-
     Ok(Json(res))
 }
 
@@ -203,7 +217,7 @@ async fn serve_index_html(state: State<TestState>) -> Result<impl IntoResponse, 
         <head>
             <meta charset="UTF-8" />
             <title>libp2p ping test</title>
-            <script type="module"">
+            <script type="module">
                 // import a wasm initialization fn and our test entrypoint
                 import init, {{ run_test_wasm }} from "/interop_tests.js";
 

@@ -77,7 +77,6 @@ pub async fn run_test(
             let handshake_start = Instant::now();
 
             swarm.dial(other.parse::<Multiaddr>()?)?;
-            tracing::info!(listener=%other, "Test instance, dialing multiaddress");
 
             let rtt = loop {
                 if let Some(SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event {
@@ -120,28 +119,55 @@ pub async fn run_test(
                     }
                     if listener_id == id {
                         let ma = format!("{address}/p2p/{}", swarm.local_peer_id());
+                        // BLPOP pops the oldest list element; drop any leftover rows from prior runs.
+                        redis_client.del("listenerAddr").await?;
                         redis_client.rpush("listenerAddr", ma.clone()).await?;
                         break;
                     }
                 }
             }
 
-            // Drive Swarm while we await for `dialerDone` to be ready.
-            futures::future::select(
+            // Exit once the dialer connects and the first ping succeeds (mirrors dialer side).
+            let mut handshake_start = None;
+            match futures::future::select(
                 async move {
                     loop {
-                        let event = swarm.next().await.unwrap();
+                        let event = swarm
+                            .next()
+                            .await
+                            .context("Swarm stream ended unexpectedly")?;
 
                         tracing::debug!("{event:?}");
+
+                        if let SwarmEvent::ConnectionEstablished { .. } = &event {
+                            handshake_start.get_or_insert_with(Instant::now);
+                        }
+
+                        if let SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event {
+                            result: Ok(rtt),
+                            ..
+                        })) = event
+                        {
+                            tracing::info!(?rtt, "Ping successful");
+                            let start = handshake_start.unwrap_or_else(Instant::now);
+                            return Ok(Report {
+                                handshake_plus_one_rtt_millis: start.elapsed().as_micros() as f32
+                                    / 1000.,
+                                ping_rtt_millis: rtt.as_micros() as f32 / 1000.,
+                            });
+                        }
                     }
                 }
                 .boxed(),
                 arch::sleep(test_timeout),
             )
-            .await;
-
-            // The loop never ends so if we get here, we hit the timeout.
-            bail!("Test should have been killed by the test runner!");
+            .await
+            {
+                futures::future::Either::Left((report, _)) => report,
+                futures::future::Either::Right(_) => {
+                    bail!("Timed out waiting for dialer ping")
+                }
+            }
         }
     }
 }
@@ -167,7 +193,6 @@ pub async fn run_test_wasm(
         muxer,
     )
     .await;
-    tracing::info!(?result, "Sending test result");
     reqwest::Client::new()
         .post(&format!("http://{}/results", base_url))
         .json(&result.map_err(|e| e.to_string()))

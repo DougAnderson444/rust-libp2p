@@ -47,6 +47,7 @@ async fn outbound_inner(
     tracing::trace!(?local_fingerprint);
     tracing::trace!(?remote_fingerprint);
 
+
     let peer_id = noise::outbound(id_keys, channel, remote_fingerprint, local_fingerprint)
         .await
         .map_err(AuthenticationError)?;
