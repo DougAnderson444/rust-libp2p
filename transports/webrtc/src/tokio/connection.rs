@@ -22,6 +22,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, Waker},
+    time::Duration,
 };
 
 use futures::{
@@ -33,15 +34,16 @@ use futures::{
     lock::Mutex as FutMutex,
     ready,
     stream::FuturesUnordered,
-    StreamExt,
+    FutureExt, StreamExt,
 };
+use futures_timer::Delay;
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
 use webrtc::{
     data::data_channel::DataChannel as DetachedDataChannel, data_channel::RTCDataChannel,
     peer_connection::RTCPeerConnection,
 };
 
-use crate::tokio::{error::Error, stream, stream::Stream};
+use crate::tokio::{diagnostics::log_sctp_snapshot, error::Error, stream, stream::Stream};
 
 /// Maximum number of unprocessed data channels.
 /// See [`Connection::poll_inbound`].
@@ -66,28 +68,61 @@ pub struct Connection {
     /// A list of futures, which, once completed, signal that a [`Stream`] has been dropped.
     drop_listeners: FuturesUnordered<stream::DropListener>,
     no_drop_listeners_waker: Option<Waker>,
+    /// Monotonic muxer substream counter (independent of SCTP id).
+    mux_inbound_count: u32,
+    mux_outbound_count: u32,
+    /// Brief delay before the first outbound mux channel (browser offerer → native answerer interop).
+    outbound_defer: Option<Pin<Box<Delay>>>,
+    outbound_defer_waker: Option<Waker>,
+    /// Set once the defer window ends (timer or first inbound); identify+ping poll outbound concurrently.
+    outbound_defer_done: bool,
 }
 
 impl Unpin for Connection {}
 
 impl Connection {
-    /// Creates a new connection.
-    pub(crate) async fn new(rtc_conn: RTCPeerConnection) -> Self {
+    /// Registers [`RTCPeerConnection::on_data_channel`] and returns the receiver for muxer inbound
+    /// substreams.
+    ///
+    /// Must be called **before** `set_remote_description` / `set_local_description` so DCEP and
+    /// SCTP-negotiated channels from the remote peer are not dropped (interop: browser offerer →
+    /// native answerer).
+    pub(crate) async fn setup_incoming_data_channels(
+        rtc_conn: &RTCPeerConnection,
+    ) -> mpsc::Receiver<Arc<DetachedDataChannel>> {
         let (data_channel_tx, data_channel_rx) = mpsc::channel(MAX_DATA_CHANNELS_IN_FLIGHT);
 
         Connection::register_incoming_data_channels_handler(
-            &rtc_conn,
+            rtc_conn,
             Arc::new(FutMutex::new(data_channel_tx)),
         )
         .await;
 
+        tracing::debug!(
+            target: "libp2p_webrtc_mux",
+            "registered RTCPeerConnection on_data_channel handler"
+        );
+
+        data_channel_rx
+    }
+
+    /// Creates a new connection.
+    pub(crate) fn new(
+        rtc_conn: RTCPeerConnection,
+        incoming_data_channels_rx: mpsc::Receiver<Arc<DetachedDataChannel>>,
+    ) -> Self {
         Self {
             peer_conn: Arc::new(FutMutex::new(rtc_conn)),
-            incoming_data_channels_rx: data_channel_rx,
+            incoming_data_channels_rx,
             outbound_fut: None,
             close_fut: None,
             drop_listeners: FuturesUnordered::default(),
             no_drop_listeners_waker: None,
+            mux_inbound_count: 0,
+            mux_outbound_count: 0,
+            outbound_defer: None,
+            outbound_defer_waker: None,
+            outbound_defer_done: false,
         }
     }
 
@@ -102,24 +137,87 @@ impl Connection {
         tx: Arc<FutMutex<mpsc::Sender<Arc<DetachedDataChannel>>>>,
     ) {
         rtc_conn.on_data_channel(Box::new(move |data_channel: Arc<RTCDataChannel>| {
-            tracing::debug!(channel=%data_channel.id(), "Incoming data channel");
+            // Stream 0 is the negotiated Noise handshake channel. Ignore only that case.
+            //
+            // Do **not** filter on `id() == 0` alone: webrtc-rs invokes this handler
+            // before the SCTP stream id is copied onto `RTCDataChannel`, so inbound
+            // DCEP channels (2, 4, 6, …) also appear as id=0 with negotiated=false
+            // until `handle_open` runs (see webrtc 0.17 `RTCDataChannel::new`).
+            if data_channel.negotiated() && data_channel.id() == 0 {
+                tracing::debug!(
+                    target: "libp2p_webrtc_mux",
+                    dc_id = 0u16,
+                    negotiated = true,
+                    ready_state = ?data_channel.ready_state(),
+                    "on_data_channel invoked for negotiated id=0 (noise, ignoring for muxer)"
+                );
+                return Box::pin(async {});
+            }
+
+            tracing::debug!(
+                target: "libp2p_webrtc_mux",
+                dc_id = data_channel.id(),
+                negotiated = data_channel.negotiated(),
+                ready_state = ?data_channel.ready_state(),
+                label = %data_channel.label(),
+                "on_data_channel invoked (awaiting open)"
+            );
 
             let tx = tx.clone();
 
             Box::pin(async move {
+                data_channel.on_error({
+                    let dc_id = data_channel.id();
+                    Box::new(move |err| {
+                        Box::pin(async move {
+                            tracing::error!(
+                                target: "libp2p_webrtc_mux",
+                                dc_id,
+                                error = %err,
+                                "inbound data channel error before detach"
+                            );
+                        })
+                    })
+                });
+
+                data_channel.on_close({
+                    let dc_id = data_channel.id();
+                    Box::new(move || {
+                        Box::pin(async move {
+                            tracing::debug!(
+                                target: "libp2p_webrtc_mux",
+                                dc_id,
+                                "inbound data channel closed before detach"
+                            );
+                        })
+                    })
+                });
+
                 data_channel.on_open({
                     let data_channel = data_channel.clone();
                     Box::new(move || {
-                        tracing::debug!(channel=%data_channel.id(), "Data channel open");
+                        tracing::debug!(
+                            target: "libp2p_webrtc_mux",
+                            rtc_id = data_channel.id(),
+                            ready_state = ?data_channel.ready_state(),
+                            "inbound data channel open (detaching)"
+                        );
 
                         Box::pin(async move {
                             let data_channel = data_channel.clone();
-                            let id = data_channel.id();
+                            let rtc_id = data_channel.id();
                             match data_channel.detach().await {
                                 Ok(detached) => {
+                                    let sctp_id = detached.stream_identifier();
+                                    tracing::debug!(
+                                        target: "libp2p_webrtc_mux",
+                                        rtc_id,
+                                        sctp_id,
+                                        "inbound data channel detached"
+                                    );
                                     let mut tx = tx.lock().await;
                                     if let Err(e) = tx.try_send(detached.clone()) {
-                                        tracing::error!(channel=%id, "Can't send data channel: {}", e);
+                                        tracing::error!(channel=%sctp_id, "Can't send data channel: {}", e);
                                         // We're not accepting data channels fast enough =>
                                         // close this channel.
                                         //
@@ -128,7 +226,7 @@ impl Connection {
                                         // possible with the current API.
                                         if let Err(e) = detached.close().await {
                                             tracing::error!(
-                                                channel=%id,
+                                                channel=%sctp_id,
                                                 "Failed to close data channel: {}",
                                                 e
                                             );
@@ -136,7 +234,7 @@ impl Connection {
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::error!(channel=%id, "Can't detach data channel: {}", e);
+                                    tracing::error!(channel=%rtc_id, "Can't detach data channel: {}", e);
                                 }
                             };
                         })
@@ -155,9 +253,24 @@ impl StreamMuxer for Connection {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
+        log_sctp_snapshot(&self.peer_conn, "poll_inbound");
+
         match ready!(self.incoming_data_channels_rx.poll_next_unpin(cx)) {
             Some(detached) => {
-                tracing::trace!(stream=%detached.stream_identifier(), "Incoming stream");
+                self.mux_inbound_count += 1;
+                tracing::debug!(
+                    target: "libp2p_webrtc_mux",
+                    mux_index = self.mux_inbound_count,
+                    dc_id = detached.stream_identifier(),
+                    "muxer inbound substream ready"
+                );
+                if self.mux_inbound_count == 1 && !self.outbound_defer_done {
+                    self.outbound_defer_done = true;
+                    self.outbound_defer = None;
+                    if let Some(waker) = self.outbound_defer_waker.take() {
+                        waker.wake();
+                    }
+                }
 
                 let (stream, drop_listener) = Stream::new(detached);
                 self.drop_listeners.push(drop_listener);
@@ -202,6 +315,36 @@ impl StreamMuxer for Connection {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
+        log_sctp_snapshot(&self.peer_conn, "poll_outbound");
+
+        // Browser→native: let the offerer's mux DCEP be accepted before we dial our own channels.
+        if !self.outbound_defer_done {
+            if self.outbound_defer.is_none() {
+                self.outbound_defer = Some(Box::pin(Delay::new(Duration::from_millis(250))));
+                tracing::debug!(
+                    target: "libp2p_webrtc_mux",
+                    "answerer: deferring first outbound mux channel for remote DCEP"
+                );
+            }
+            self.outbound_defer_waker = Some(cx.waker().clone());
+            if self
+                .outbound_defer
+                .as_mut()
+                .expect("set above")
+                .poll_unpin(cx)
+                .is_pending()
+            {
+                return Poll::Pending;
+            }
+            self.outbound_defer = None;
+            self.outbound_defer_waker = None;
+            self.outbound_defer_done = true;
+            tracing::debug!(
+                target: "libp2p_webrtc_mux",
+                "answerer: opening first outbound mux channel"
+            );
+        }
+
         let peer_conn = self.peer_conn.clone();
         let fut = self.outbound_fut.get_or_insert(Box::pin(async move {
             let peer_conn = peer_conn.lock().await;
@@ -228,8 +371,13 @@ impl StreamMuxer for Connection {
         match ready!(fut.as_mut().poll(cx)) {
             Ok(detached) => {
                 self.outbound_fut = None;
-
-                tracing::trace!(stream=%detached.stream_identifier(), "Outbound stream");
+                self.mux_outbound_count += 1;
+                tracing::debug!(
+                    target: "libp2p_webrtc_mux",
+                    mux_index = self.mux_outbound_count,
+                    dc_id = detached.stream_identifier(),
+                    "muxer outbound substream ready"
+                );
 
                 let (stream, drop_listener) = Stream::new(detached);
                 self.drop_listeners.push(drop_listener);

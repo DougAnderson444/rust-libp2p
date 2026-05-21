@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use interop_tests::{BlpopRequest, Report};
+use interop_tests::{BlpopRequest, Report, WasmLogBatch};
 use redis::{AsyncCommands, Client};
 use thirtyfour::prelude::*;
 use tokio::{
@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
         Some(_) => EnvFilter::try_from_default_env().context("invalid `RUST_LOG` filter")?,
         None => EnvFilter::builder()
             .with_default_directive(LevelFilter::INFO.into())
-            .parse_lossy("interop_tests=info,tower_http=warn,hyper=warn"),
+            .parse_lossy("info,wasm_ping=info,wasm=debug,tower_http=warn,hyper=warn"),
     };
     tracing_subscriber::registry()
         .with(fmt::layer())
@@ -76,6 +76,7 @@ async fn main() -> Result<()> {
         .route("/blpop", post(redis_blpop))
         // Report tests status
         .route("/results", post(post_results))
+        .route("/log", post(host_log))
         // Wasm ping test trigger
         .route("/", get(serve_index_html))
         // Wasm app static files
@@ -91,8 +92,17 @@ async fn main() -> Result<()> {
         .with_context(|| format!("bind HTTP harness on {BIND_ADDR}"))?;
     tokio::spawn(axum::serve(listener, app).into_future());
 
+    let headless = std::env::var("WASM_PING_HEADLESS")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true);
+    tracing::info!(
+        headless,
+        "wasm_ping harness: starting chromedriver + Chrome"
+    );
+
     // Start executing the test in a browser
-    let (mut chrome, driver) = open_in_browser().await?;
+    let (mut chrome, driver) = open_in_browser(headless).await?;
+    tracing::info!("wasm_ping harness: browser loaded test page");
 
     // Wait for the outcome to be reported
     let test_result = match tokio::time::timeout(test_timeout, results_rx.recv()).await {
@@ -113,7 +123,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn open_in_browser() -> Result<(Child, WebDriver)> {
+async fn open_in_browser(headless: bool) -> Result<(Child, WebDriver)> {
     // start a webdriver process
     // currently only the chromedriver is supported as firefox doesn't
     // have support yet for the certhashes
@@ -145,7 +155,9 @@ async fn open_in_browser() -> Result<(Child, WebDriver)> {
 
     // run a webdriver client
     let mut caps = DesiredCapabilities::chrome();
-    caps.set_headless()?;
+    if headless {
+        caps.set_headless()?;
+    }
     caps.set_disable_dev_shm_usage()?;
     caps.set_no_sandbox()?;
     let driver = WebDriver::new("http://localhost:45782", caps).await?;
@@ -178,6 +190,20 @@ async fn redis_blpop(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     Ok(Json(res))
+}
+
+/// Receive batched log lines from the in-browser WASM dialer.
+async fn host_log(Json(batch): Json<WasmLogBatch>) -> StatusCode {
+    for line in batch.lines {
+        // Dialer logs at DEBUG so they do not drown out harness INFO/DEBUG (chromedriver, HTTP).
+        // Enable with `RUST_LOG=wasm=debug` or `RUST_LOG=debug`.
+        if line.starts_with("WARN ") || line.starts_with("ERROR ") {
+            tracing::warn!(target: "wasm", "{line}");
+        } else {
+            tracing::debug!(target: "wasm", "{line}");
+        }
+    }
+    StatusCode::OK
 }
 
 /// Receive test results

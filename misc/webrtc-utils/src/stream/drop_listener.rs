@@ -37,12 +37,18 @@ use crate::{
 
 #[must_use]
 pub struct DropListener<T> {
+    dc_id: Option<u16>,
     state: State<T>,
 }
 
 impl<T> DropListener<T> {
-    pub fn new(stream: FramedDc<T>, receiver: oneshot::Receiver<GracefullyClosed>) -> Self {
+    pub fn new(
+        stream: FramedDc<T>,
+        receiver: oneshot::Receiver<GracefullyClosed>,
+        dc_id: Option<u16>,
+    ) -> Self {
         Self {
+            dc_id,
             state: State::Idle { stream, receiver },
         }
     }
@@ -71,8 +77,9 @@ where
 {
     type Output = io::Result<()>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let state = &mut self.get_mut().state;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let dc_id = self.dc_id;
+        let state = &mut self.as_mut().get_mut().state;
 
         loop {
             match std::mem::replace(state, State::Poisoned) {
@@ -84,7 +91,11 @@ where
                         return Poll::Ready(Ok(()));
                     }
                     Poll::Ready(Err(Canceled)) => {
-                        tracing::info!("Stream dropped without graceful close, sending Reset");
+                        tracing::warn!(
+                            target: "libp2p_webrtc_mux",
+                            dc_id=?dc_id,
+                            "stream drop without graceful close → RESET"
+                        );
                         *state = State::SendingReset { stream };
                         continue;
                     }

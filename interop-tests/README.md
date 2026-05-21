@@ -33,8 +33,12 @@ To run the webrtc-direct test, you'll need the `chromedriver` in your `$PATH`, c
 
 1. Start redis: `docker run --rm -p 6379:6379 redis:7-alpine`.
 2. Build the wasm package: `RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --target web`
-3. With the webrtc-direct listener `RUST_LOG=debug,webrtc=off,webrtc_sctp=off redis_addr="127.0.0.1:6379" ip="0.0.0.0" transport=webrtc-direct is_dialer="false" cargo run --bin native_ping`
-4. Run the webrtc-direct dialer: `RUST_LOG=debug,hyper=off redis_addr="127.0.0.1:6379" ip="0.0.0.0" transport=webrtc-direct is_dialer=true cargo run --bin wasm_ping`
+3. With the webrtc-direct listener `RUST_LOG=info,sctp=warn redis_addr="127.0.0.1:6379" ip="0.0.0.0" transport=webrtc-direct is_dialer="false" cargo run --bin native_ping`
+4. Run the webrtc-direct dialer: `RUST_LOG=info,wasm=debug,sctp=warn redis_addr="127.0.0.1:6379" ip="0.0.0.0" transport=webrtc-direct is_dialer=true cargo run --bin wasm_ping`
+
+To debug WebRTC in a visible Chrome window (not headless), set `WASM_PING_HEADLESS=0` on the dialer command. You can also open `chrome://webrtc-internals` in that window while the test runs.
+
+Harness logs use the default crate/module targets; dialer lines use `target: "wasm"` at **DEBUG** so they do not hide chromedriver/HTTP. Use `wasm=info` only if you want dialer-only output.
 
 # Running all interop tests locally with Compose
 

@@ -1,3 +1,7 @@
+## Unreleased
+
+- Bump `webrtc` dependency to `0.17.1` (from `0.12.0`) to test SCTP/data-channel fixes on the last Tokio-coupled webrtc-rs release line.
+
 ## 0.10-alpha
 
 - Bump `webrtc` dependency to `0.12.0`.

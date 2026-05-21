@@ -26,10 +26,8 @@ async fn outbound_inner(
 ) -> Result<(PeerId, Connection), Error> {
     let rtc_peer_connection = RtcPeerConnection::new(remote_fingerprint.algorithm()).await?;
 
-    // Create stream for Noise handshake
-    // Must create data channel before Offer is created for it to be included in the SDP
-    let (channel, listener) = rtc_peer_connection.new_handshake_stream();
-    drop(listener);
+    // Negotiated DC 0 must be created before the offer so it is present in the SDP.
+    let handshake_dc = rtc_peer_connection.create_handshake_data_channel();
 
     let ufrag = libp2p_webrtc_utils::sdp::random_ufrag();
 
@@ -47,7 +45,22 @@ async fn outbound_inner(
     tracing::trace!(?local_fingerprint);
     tracing::trace!(?remote_fingerprint);
 
+    // ICE/DTLS must finish and DC 0 must be `open` before Noise (browser is event-driven).
+    tracing::debug!(
+        target: "libp2p_webrtc_mux",
+        "SDP applied; waiting for browser ICE/DTLS (see RtcPeerConnection state logs)"
+    );
+    let handshake_poll = RtcPeerConnection::wait_data_channel_open(&handshake_dc).await?;
+    tracing::debug!(
+        target: "libp2p_webrtc_mux",
+        dc_id = ?handshake_poll.id(),
+        ready_state = ?handshake_poll.ready_state(),
+        "noise handshake channel open, starting noise"
+    );
 
+    let (channel, listener) =
+        RtcPeerConnection::handshake_stream_from_poll_channel(handshake_poll);
+    drop(listener);
     let peer_id = noise::outbound(id_keys, channel, remote_fingerprint, local_fingerprint)
         .await
         .map_err(AuthenticationError)?;

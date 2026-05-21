@@ -20,6 +20,7 @@
 
 pub mod certificate;
 mod connection;
+mod diagnostics;
 mod error;
 mod fingerprint;
 mod req_res_chan;

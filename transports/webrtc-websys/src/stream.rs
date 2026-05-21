@@ -4,13 +4,15 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{AsyncRead, AsyncWrite};
+use futures::{future::poll_fn, AsyncRead, AsyncWrite};
 use send_wrapper::SendWrapper;
 use web_sys::RtcDataChannel;
 
+use crate::Error;
+
 use self::poll_data_channel::PollDataChannel;
 
-mod poll_data_channel;
+pub(crate) mod poll_data_channel;
 
 /// A stream over a WebRTC connection.
 ///
@@ -22,10 +24,38 @@ pub struct Stream {
 
 pub(crate) type DropListener = SendWrapper<libp2p_webrtc_utils::DropListener<PollDataChannel>>;
 
+/// Blocks until the data channel leaves `connecting` (ICE + DTLS must be up).
+///
+/// Returns the [`PollDataChannel`] so callers do not call [`PollDataChannel::new`] twice on the
+/// same [`RtcDataChannel`] (that drops the first JS closures while the browser may still invoke them).
+pub(crate) async fn wait_until_open(dc: &RtcDataChannel) -> Result<PollDataChannel, Error> {
+    tracing::debug!(
+        target: "libp2p_webrtc_mux",
+        dc_id = ?dc.id(),
+        ready_state = ?dc.ready_state(),
+        "waiting for data channel open (ICE/DTLS)"
+    );
+
+    let mut poll_dc = PollDataChannel::new(dc.clone());
+    poll_fn(|cx| -> Poll<Result<(), Error>> {
+        match Pin::new(&mut poll_dc).poll_ready(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(Error::Connection(e.to_string()))),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await?;
+    Ok(poll_dc)
+}
+
 impl Stream {
     pub(crate) fn new(data_channel: RtcDataChannel) -> (Self, DropListener) {
-        let (inner, drop_listener) =
-            libp2p_webrtc_utils::Stream::new(PollDataChannel::new(data_channel));
+        Self::from_poll_channel(PollDataChannel::new(data_channel))
+    }
+
+    pub(crate) fn from_poll_channel(poll_channel: PollDataChannel) -> (Self, DropListener) {
+        let dc_id = poll_channel.id();
+        let (inner, drop_listener) = libp2p_webrtc_utils::Stream::new(poll_channel, dc_id);
 
         (
             Self {

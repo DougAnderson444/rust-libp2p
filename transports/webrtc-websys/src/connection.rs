@@ -3,9 +3,11 @@
 use std::{
     pin::Pin,
     task::{ready, Context, Poll, Waker},
+    time::Duration,
 };
 
-use futures::{channel::mpsc, stream::FuturesUnordered, StreamExt};
+use futures::{channel::mpsc, stream::FuturesUnordered, FutureExt, StreamExt};
+use futures_timer::Delay;
 use js_sys::{Object, Reflect};
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
 use libp2p_webrtc_utils::Fingerprint;
@@ -18,7 +20,7 @@ use web_sys::{
 };
 
 use super::{Error, Stream};
-use crate::stream::DropListener;
+use crate::stream::{poll_data_channel::PollDataChannel, DropListener};
 
 /// A WebRTC Connection.
 ///
@@ -38,6 +40,15 @@ pub struct Connection {
     /// A list of futures, which, once completed, signal that a [`Stream`] has been dropped.
     drop_listeners: FuturesUnordered<DropListener>,
     no_drop_listeners_waker: Option<Waker>,
+    /// Monotonic muxer substream counter (independent of SCTP id).
+    mux_inbound_count: u32,
+    mux_outbound_count: u32,
+    /// Outbound data channel waiting for `open` before handing to the muxer (like native webrtc).
+    outbound_opening: Option<(SendWrapper<RtcDataChannel>, SendWrapper<PollDataChannel>)>,
+    /// Browser (DTLS client) opens even SCTP ids; defer so the answerer's odd channels land first.
+    outbound_defer: Option<Pin<Box<Delay>>>,
+    outbound_defer_done: bool,
+    outbound_defer_waker: Option<Waker>,
 
     _ondatachannel_closure: SendWrapper<Closure<dyn FnMut(RtcDataChannelEvent)>>,
 }
@@ -47,21 +58,30 @@ impl Connection {
     pub(crate) fn new(peer_connection: RtcPeerConnection) -> Self {
         // An ondatachannel Future enables us to poll for incoming data channel events in
         // poll_incoming
-        let (mut tx_ondatachannel, rx_ondatachannel) = mpsc::channel(4); // we may get more than one data channel opened on a single peer connection
+        let (tx_ondatachannel, rx_ondatachannel) = mpsc::channel(4); // we may get more than one data channel opened on a single peer connection
 
         let ondatachannel_closure = Closure::new(move |ev: RtcDataChannelEvent| {
-            tracing::trace!("New data channel");
-
-            if let Err(e) = tx_ondatachannel.try_send(ev.channel()) {
-                if e.is_full() {
-                    tracing::warn!("Remote is opening too many data channels, we can't keep up!");
-                    return;
+            let channel = ev.channel();
+            let mut tx = tx_ondatachannel.clone();
+            let deliver = Closure::once(move || {
+                tracing::trace!("New data channel");
+                if let Err(e) = tx.try_send(channel) {
+                    if e.is_full() {
+                        tracing::warn!(
+                            "Remote is opening too many data channels, we can't keep up!"
+                        );
+                    } else if e.is_disconnected() {
+                        tracing::warn!("Receiver is gone, are we shutting down?");
+                    }
                 }
-
-                if e.is_disconnected() {
-                    tracing::warn!("Receiver is gone, are we shutting down?");
-                }
+            });
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                    deliver.as_ref().unchecked_ref(),
+                    0,
+                );
             }
+            deliver.forget();
         });
         peer_connection
             .inner
@@ -73,12 +93,18 @@ impl Connection {
             drop_listeners: FuturesUnordered::default(),
             no_drop_listeners_waker: None,
             inbound_data_channels: SendWrapper::new(rx_ondatachannel),
+            mux_inbound_count: 0,
+            mux_outbound_count: 0,
+            outbound_opening: None,
+            outbound_defer: None,
+            outbound_defer_done: false,
+            outbound_defer_waker: None,
             _ondatachannel_closure: SendWrapper::new(ondatachannel_closure),
         }
     }
 
-    fn new_stream_from_data_channel(&mut self, data_channel: RtcDataChannel) -> Stream {
-        let (stream, drop_listener) = Stream::new(data_channel);
+    fn new_stream_from_poll_channel(&mut self, poll_channel: PollDataChannel) -> Stream {
+        let (stream, drop_listener) = Stream::from_poll_channel(poll_channel);
 
         self.drop_listeners.push(drop_listener);
         if let Some(waker) = self.no_drop_listeners_waker.take() {
@@ -116,31 +142,114 @@ impl StreamMuxer for Connection {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
-        match ready!(self.inbound_data_channels.poll_next_unpin(cx)) {
-            Some(data_channel) => {
-                let stream = self.new_stream_from_data_channel(data_channel);
-
-                Poll::Ready(Ok(stream))
-            }
-            None => {
-                // This only happens if the [`RtcPeerConnection::ondatachannel`] closure gets freed
-                // which means we are most likely shutting down the connection.
-                tracing::debug!("`Sender` for inbound data channels has been dropped");
-                Poll::Ready(Err(Error::Connection("connection closed".to_owned())))
+        loop {
+            match ready!(self.inbound_data_channels.poll_next_unpin(cx)) {
+                Some(data_channel) => {
+                    if data_channel.id() == Some(0) {
+                        tracing::debug!(
+                            target: "libp2p_webrtc_mux",
+                            "ignoring inbound data channel id=0 (negotiated noise, not muxer)"
+                        );
+                        continue;
+                    }
+                    self.mux_inbound_count += 1;
+                    tracing::debug!(
+                        target: "libp2p_webrtc_mux",
+                        mux_index = self.mux_inbound_count,
+                        dc_id = ?data_channel.id(),
+                        ready_state = ?data_channel.ready_state(),
+                        "muxer inbound substream ready"
+                    );
+                    let stream = self.new_stream_from_poll_channel(PollDataChannel::new(data_channel));
+                    if self.mux_inbound_count >= 2 && !self.outbound_defer_done {
+                        self.outbound_defer_done = true;
+                        self.outbound_defer = None;
+                        if let Some(waker) = self.outbound_defer_waker.take() {
+                            waker.wake();
+                        }
+                    }
+                    return Poll::Ready(Ok(stream));
+                }
+                None => {
+                    // This only happens if the [`RtcPeerConnection::ondatachannel`] closure gets freed
+                    // which means we are most likely shutting down the connection.
+                    tracing::debug!("`Sender` for inbound data channels has been dropped");
+                    return Poll::Ready(Err(Error::Connection("connection closed".to_owned())));
+                }
             }
         }
     }
 
     fn poll_outbound(
         mut self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
-        tracing::trace!("Creating outbound data channel");
+        if !self.outbound_defer_done {
+            if self.outbound_defer.is_none() {
+                self.outbound_defer = Some(Box::pin(Delay::new(Duration::from_millis(400))));
+                tracing::debug!(
+                    target: "libp2p_webrtc_mux",
+                    "offerer: deferring first outbound mux channel for answerer DCEP"
+                );
+            }
+            self.outbound_defer_waker = Some(cx.waker().clone());
+            if self
+                .outbound_defer
+                .as_mut()
+                .expect("set above")
+                .poll_unpin(cx)
+                .is_pending()
+            {
+                return Poll::Pending;
+            }
+            self.outbound_defer = None;
+            self.outbound_defer_waker = None;
+            self.outbound_defer_done = true;
+            tracing::debug!(
+                target: "libp2p_webrtc_mux",
+                "offerer: opening first outbound mux channel"
+            );
+        }
 
-        let data_channel = self.inner.new_regular_data_channel();
-        let stream = self.new_stream_from_data_channel(data_channel);
+        loop {
+            if self.outbound_opening.is_none() {
+                let dc = self.inner.new_regular_data_channel();
+                tracing::debug!(
+                    target: "libp2p_webrtc_mux",
+                    dc_id = ?dc.id(),
+                    ready_state = ?dc.ready_state(),
+                    "opening muxer outbound data channel"
+                );
+                let poll_dc = PollDataChannel::new(dc.clone());
+                self.outbound_opening = Some((SendWrapper::new(dc), SendWrapper::new(poll_dc)));
+            }
 
-        Poll::Ready(Ok(stream))
+            let (_dc, poll_dc) = self
+                .outbound_opening
+                .as_mut()
+                .expect("outbound_opening set above");
+
+            match Pin::new(&mut **poll_dc).poll_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => {
+                    self.outbound_opening = None;
+                    return Poll::Ready(Err(Error::Connection(format!("{e}"))));
+                }
+                Poll::Ready(Ok(())) => {
+                    let (_dc, poll_dc) = self.outbound_opening.take().expect("just polled");
+                    let poll_dc = poll_dc.take();
+                    self.mux_outbound_count += 1;
+                    tracing::debug!(
+                        target: "libp2p_webrtc_mux",
+                        mux_index = self.mux_outbound_count,
+                        dc_id = ?poll_dc.id(),
+                        ready_state = ?poll_dc.ready_state(),
+                        "muxer outbound substream ready"
+                    );
+                    return Poll::Ready(Ok(self.new_stream_from_poll_channel(poll_dc)));
+                }
+            }
+        }
     }
 
     /// Closes the Peer Connection.
@@ -175,6 +284,7 @@ impl StreamMuxer for Connection {
 
 pub(crate) struct RtcPeerConnection {
     inner: web_sys::RtcPeerConnection,
+    _ice_state_log: SendWrapper<Closure<dyn FnMut(web_sys::Event)>>,
 }
 
 impl RtcPeerConnection {
@@ -191,21 +301,45 @@ impl RtcPeerConnection {
         let certificate = JsFuture::from(certificate_promise).await?;
 
         let config = RtcConfiguration::default();
+        // No STUN/TURN — webrtc-direct uses explicit host candidates in the synthetic SDP answer.
+        config.set_ice_servers(&js_sys::Array::new());
         // wrap certificate in a js Array first before adding it to the config object
         let certificate_arr = js_sys::Array::new();
         certificate_arr.push(&certificate);
         config.set_certificates(&certificate_arr);
 
         let inner = web_sys::RtcPeerConnection::new_with_configuration(&config)?;
+        let ice_state_log = attach_ice_state_logging(&inner);
 
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            _ice_state_log: SendWrapper::new(ice_state_log),
+        })
     }
 
-    /// Creates the stream for the initial noise handshake.
-    ///
-    /// The underlying data channel MUST have `negotiated` set to `true` and carry the ID 0.
-    pub(crate) fn new_handshake_stream(&self) -> (Stream, DropListener) {
-        Stream::new(self.new_data_channel(true))
+    /// Creates negotiated data channel 0 for Noise (must exist before creating the SDP offer).
+    pub(crate) fn create_handshake_data_channel(&self) -> RtcDataChannel {
+        tracing::debug!(
+            target: "libp2p_webrtc_mux",
+            dc_id = 0u16,
+            negotiated = true,
+            "creating noise handshake data channel (not a muxer substream)"
+        );
+        self.new_data_channel(true)
+    }
+
+    /// Wraps an open handshake channel as a libp2p [`Stream`].
+    pub(crate) fn handshake_stream_from_poll_channel(
+        poll_channel: crate::stream::poll_data_channel::PollDataChannel,
+    ) -> (Stream, DropListener) {
+        Stream::from_poll_channel(poll_channel)
+    }
+
+    /// Blocks until the channel leaves `connecting` (ICE + DTLS must be up).
+    pub(crate) async fn wait_data_channel_open(
+        dc: &RtcDataChannel,
+    ) -> Result<crate::stream::poll_data_channel::PollDataChannel, Error> {
+        crate::stream::wait_until_open(dc).await
     }
 
     /// Creates a regular data channel for when the connection is already established.
@@ -213,6 +347,11 @@ impl RtcPeerConnection {
         self.new_data_channel(false)
     }
 
+    /// Creates a data channel.
+    ///
+    /// - `negotiated = true`: fixed SCTP stream **id 0** for Noise (both peers must create it).
+    /// - `negotiated = false`: browser/stack assigns the next id (1, 2, 3, …); each muxer
+    ///   substream is a **new** id, not “the first of its kind” as 0.
     fn new_data_channel(&self, negotiated: bool) -> RtcDataChannel {
         const LABEL: &str = "";
 
@@ -228,6 +367,14 @@ impl RtcPeerConnection {
             false => self.inner.create_data_channel(LABEL),
         };
         dc.set_binary_type(RtcDataChannelType::Arraybuffer); // Hardcoded here, it's the only type we use
+
+        tracing::debug!(
+            target: "libp2p_webrtc_mux",
+            negotiated,
+            dc_id = ?dc.id(),
+            ready_state = ?dc.ready_state(),
+            "created data channel"
+        );
 
         dc
     }
@@ -275,6 +422,19 @@ impl RtcPeerConnection {
 
         Ok(())
     }
+}
+
+fn attach_ice_state_logging(pc: &web_sys::RtcPeerConnection) -> Closure<dyn FnMut(web_sys::Event)> {
+    let pc_log = pc.clone();
+    let closure = Closure::wrap(Box::new(move |_: web_sys::Event| {
+        tracing::debug!(
+            target: "libp2p_webrtc_mux",
+            ice_connection_state = ?pc_log.ice_connection_state(),
+            "RtcPeerConnection ICE state"
+        );
+    }) as Box<dyn FnMut(web_sys::Event)>);
+    pc.set_oniceconnectionstatechange(Some(closure.as_ref().unchecked_ref()));
+    closure
 }
 
 /// Parse Fingerprint from a SDP.

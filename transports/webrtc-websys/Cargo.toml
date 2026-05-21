@@ -14,6 +14,7 @@ publish = true
 [dependencies]
 bytes = "1"
 futures = { workspace = true }
+futures-timer = { version = "3", features = ["wasm-bindgen"] }
 getrandom = { workspace = true, features = ["js"] }
 hex = "0.4.3"
 js-sys = { version = "0.3" }
@@ -25,7 +26,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 wasm-bindgen = { version = "0.2.90" }
 wasm-bindgen-futures = { version = "0.4.42" }
-web-sys = { version = "0.3.70", features = ["Document", "Location", "MessageEvent", "Navigator", "RtcCertificate", "RtcConfiguration", "RtcDataChannel", "RtcDataChannelEvent", "RtcDataChannelInit", "RtcDataChannelState", "RtcDataChannelType", "RtcPeerConnection", "RtcSdpType", "RtcSessionDescription", "RtcSessionDescriptionInit", "Window"] }
+web-sys = { version = "0.3.70", features = ["Document", "Location", "MessageEvent", "Navigator", "RtcCertificate", "RtcConfiguration", "RtcDataChannel", "RtcDataChannelEvent", "RtcDataChannelInit", "RtcDataChannelState", "RtcDataChannelType", "RtcIceConnectionState", "RtcPeerConnection", "RtcSdpType", "RtcSessionDescription", "RtcSessionDescriptionInit", "Window"] }
 
 [lints]
 workspace = true

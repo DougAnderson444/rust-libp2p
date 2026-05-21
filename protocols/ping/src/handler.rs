@@ -205,12 +205,18 @@ impl Handler {
                 return;
             }
             // Note: This timeout only covers protocol negotiation.
-            StreamUpgradeError::Timeout => Failure::Other {
-                error: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "ping protocol negotiation timed out",
-                )),
-            },
+            StreamUpgradeError::Timeout => {
+                tracing::debug!(
+                    target: "libp2p_webrtc_mux",
+                    "ping handler: substream upgrade timed out (muxer open and/or multistream-select)"
+                );
+                Failure::Other {
+                    error: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "ping protocol negotiation timed out",
+                    )),
+                }
+            }
             StreamUpgradeError::Apply(e) => libp2p_core::util::unreachable(e),
             StreamUpgradeError::Io(e) => Failure::Other { error: Box::new(e) },
         };
@@ -324,6 +330,10 @@ impl ConnectionHandler for Handler {
                     Poll::Pending => break,
                     Poll::Ready(()) => {
                         self.outbound = Some(OutboundState::OpenStream);
+                        tracing::debug!(
+                            target: "libp2p_webrtc_mux",
+                            "ping handler: requesting outbound muxer substream"
+                        );
                         let protocol = SubstreamProtocol::new(ReadyUpgrade::new(PROTOCOL_NAME), ());
                         return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest {
                             protocol,
@@ -345,6 +355,10 @@ impl ConnectionHandler for Handler {
                 protocol: mut stream,
                 ..
             }) => {
+                tracing::debug!(
+                    target: "libp2p_webrtc_mux",
+                    "ping handler: inbound substream negotiated"
+                );
                 stream.ignore_for_keep_alive();
                 self.inbound = Some(protocol::recv_ping(stream).boxed());
             }
@@ -352,6 +366,10 @@ impl ConnectionHandler for Handler {
                 protocol: mut stream,
                 ..
             }) => {
+                tracing::debug!(
+                    target: "libp2p_webrtc_mux",
+                    "ping handler: outbound substream negotiated, starting ping"
+                );
                 stream.ignore_for_keep_alive();
                 self.outbound = Some(OutboundState::Ping(
                     send_ping(stream, self.config.timeout).boxed(),

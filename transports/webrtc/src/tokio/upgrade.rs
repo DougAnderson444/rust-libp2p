@@ -41,7 +41,14 @@ use webrtc::{
     peer_connection::{configuration::RTCConfiguration, RTCPeerConnection},
 };
 
-use crate::tokio::{error::Error, sdp, sdp::random_ufrag, stream::Stream, Connection};
+use crate::tokio::{
+    diagnostics::{attach_peer_connection_diagnostics, log_upgrade_step},
+    error::Error,
+    sdp,
+    sdp::random_ufrag,
+    stream::Stream,
+    Connection,
+};
 
 /// Creates a new outbound WebRTC connection.
 pub(crate) async fn outbound(
@@ -55,16 +62,25 @@ pub(crate) async fn outbound(
     tracing::debug!(address=%addr, "new outbound connection to address");
 
     let (peer_connection, ufrag) = new_outbound_connection(addr, config, udp_mux).await?;
+    attach_peer_connection_diagnostics(&peer_connection, "outbound");
+    log_upgrade_step(&peer_connection, "outbound", "peer_connection_created");
+
+    let incoming_data_channels =
+        Connection::setup_incoming_data_channels(&peer_connection).await;
+    log_upgrade_step(&peer_connection, "outbound", "on_data_channel_registered");
 
     let offer = peer_connection.create_offer(None).await?;
     tracing::debug!(offer=%offer.sdp, "created SDP offer for outbound connection");
     peer_connection.set_local_description(offer).await?;
+    log_upgrade_step(&peer_connection, "outbound", "set_local_description(offer)");
 
     let answer = sdp::answer(addr, server_fingerprint, &ufrag);
     tracing::debug!(?answer, "calculated SDP answer for outbound connection");
     peer_connection.set_remote_description(answer).await?; // This will start the gathering of ICE candidates.
+    log_upgrade_step(&peer_connection, "outbound", "set_remote_description(answer)");
 
     let data_channel = create_substream_for_noise_handshake(&peer_connection).await?;
+    log_upgrade_step(&peer_connection, "outbound", "noise_dc0_open");
     let peer_id = noise::outbound(
         id_keys,
         data_channel,
@@ -73,7 +89,7 @@ pub(crate) async fn outbound(
     )
     .await?;
 
-    Ok((peer_id, Connection::new(peer_connection).await))
+    Ok((peer_id, Connection::new(peer_connection, incoming_data_channels)))
 }
 
 /// Creates a new inbound WebRTC connection.
@@ -88,16 +104,25 @@ pub(crate) async fn inbound(
     tracing::debug!(address=%addr, ufrag=%remote_ufrag, "new inbound connection from address");
 
     let peer_connection = new_inbound_connection(addr, config, udp_mux, &remote_ufrag).await?;
+    attach_peer_connection_diagnostics(&peer_connection, "inbound");
+    log_upgrade_step(&peer_connection, "inbound", "peer_connection_created");
+
+    let incoming_data_channels =
+        Connection::setup_incoming_data_channels(&peer_connection).await;
+    log_upgrade_step(&peer_connection, "inbound", "on_data_channel_registered");
 
     let offer = sdp::offer(addr, &remote_ufrag);
     tracing::debug!(?offer, "calculated SDP offer for inbound connection");
     peer_connection.set_remote_description(offer).await?;
+    log_upgrade_step(&peer_connection, "inbound", "set_remote_description(offer)");
 
     let answer = peer_connection.create_answer(None).await?;
     tracing::debug!(?answer, "created SDP answer for inbound connection");
     peer_connection.set_local_description(answer).await?; // This will start the gathering of ICE candidates.
+    log_upgrade_step(&peer_connection, "inbound", "set_local_description(answer)");
 
     let data_channel = create_substream_for_noise_handshake(&peer_connection).await?;
+    log_upgrade_step(&peer_connection, "inbound", "noise_dc0_open");
     let client_fingerprint = get_remote_fingerprint(&peer_connection).await;
     let peer_id = noise::inbound(
         id_keys,
@@ -107,7 +132,7 @@ pub(crate) async fn inbound(
     )
     .await?;
 
-    Ok((peer_id, Connection::new(peer_connection).await))
+    Ok((peer_id, Connection::new(peer_connection, incoming_data_channels)))
 }
 
 async fn new_outbound_connection(
@@ -235,6 +260,12 @@ async fn create_substream_for_noise_handshake(conn: &RTCPeerConnection) -> Resul
     };
 
     let (substream, drop_listener) = Stream::new(channel);
+    tracing::debug!(
+        target: "libp2p_webrtc_mux",
+        dc_id = 0u16,
+        negotiated = true,
+        "noise handshake stream (not a muxer substream)"
+    );
     drop(drop_listener); // Don't care about cancelled substreams during initial handshake.
 
     Ok(substream)

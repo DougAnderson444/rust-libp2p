@@ -13,8 +13,16 @@ use libp2p::{
 use wasm_bindgen::prelude::*;
 
 mod arch;
+#[cfg(target_arch = "wasm32")]
+mod host_log;
 
 use arch::{build_swarm, init_logger, Instant, RedisClient};
+
+/// Batched log lines from the WASM dialer (`POST /log` on the harness).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct WasmLogBatch {
+    pub lines: Vec<String>,
+}
 
 pub async fn run_test(
     transport: &str,
@@ -25,7 +33,7 @@ pub async fn run_test(
     sec_protocol: Option<String>,
     muxer: Option<String>,
 ) -> Result<Report> {
-    init_logger();
+    init_logger(redis_addr);
 
     let test_timeout = Duration::from_secs(test_timeout_seconds);
     let transport = transport.parse().context("Couldn't parse transport")?;
@@ -65,6 +73,12 @@ pub async fn run_test(
     // Run a ping interop test. Based on `is_dialer`, either dial the address
     // retrieved via `listenAddr` key over the redis connection. Or wait to be pinged and have
     // `dialerDone` key ready on the redis connection.
+    // Number of successful pings required before the test is considered passing.
+    // Using more than one exercises that subsequent messages (not just the first)
+    // can flow over the connection — important for WebRTC where the Noise substream
+    // close semantics caused later bytes to stall.
+    const PING_COUNT: u32 = 12;
+
     match is_dialer {
         true => {
             let result: Vec<String> = redis_client
@@ -78,21 +92,40 @@ pub async fn run_test(
 
             swarm.dial(other.parse::<Multiaddr>()?)?;
 
-            let rtt = loop {
-                if let Some(SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event {
-                    result: Ok(rtt),
-                    ..
-                }))) = swarm.next().await
-                {
-                    tracing::info!(?rtt, "Ping successful");
-                    break rtt.as_micros() as f32 / 1000.;
-                }
-            };
+            let mut ping_count = 0u32;
+            let mut handshake_plus_first_rtt: Option<f32> = None;
+            let mut last_rtt = 0f32;
 
-            let handshake_plus_ping = handshake_start.elapsed().as_micros() as f32 / 1000.;
+            loop {
+                match swarm.next().await {
+                    Some(SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event {
+                        result: Ok(rtt),
+                        ..
+                    }))) => {
+                        ping_count += 1;
+                        last_rtt = rtt.as_micros() as f32 / 1000.;
+                        tracing::info!(?rtt, "{ping_count}/{PING_COUNT} pings successful");
+                        handshake_plus_first_rtt.get_or_insert_with(|| {
+                            handshake_start.elapsed().as_micros() as f32 / 1000.
+                        });
+                        if ping_count >= PING_COUNT {
+                            break;
+                        }
+                    }
+                    Some(SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event {
+                        result: Err(e),
+                        ..
+                    }))) => {
+                        tracing::warn!(?e, "ping failed ({ping_count}/{PING_COUNT} so far)");
+                    }
+                    Some(ev) => tracing::debug!("{ev:?}"),
+                    None => bail!("Swarm stream ended unexpectedly"),
+                }
+            }
+
             Ok(Report {
-                handshake_plus_one_rtt_millis: handshake_plus_ping,
-                ping_rtt_millis: rtt,
+                handshake_plus_one_rtt_millis: handshake_plus_first_rtt.unwrap_or(0.),
+                ping_rtt_millis: last_rtt,
             })
         }
         false => {
@@ -127,10 +160,12 @@ pub async fn run_test(
                 }
             }
 
-            // Exit once the dialer connects and the first ping succeeds (mirrors dialer side).
+            // Exit once PING_COUNT pings succeed — exercises that bytes beyond the first
+            // message can still flow over the connection.
             let mut handshake_start = None;
             match futures::future::select(
                 async move {
+                    let mut ping_count = 0u32;
                     loop {
                         let event = swarm
                             .next()
@@ -143,18 +178,30 @@ pub async fn run_test(
                             handshake_start.get_or_insert_with(Instant::now);
                         }
 
-                        if let SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event {
-                            result: Ok(rtt),
-                            ..
-                        })) = event
-                        {
-                            tracing::info!(?rtt, "Ping successful");
-                            let start = handshake_start.unwrap_or_else(Instant::now);
-                            return Ok(Report {
-                                handshake_plus_one_rtt_millis: start.elapsed().as_micros() as f32
-                                    / 1000.,
-                                ping_rtt_millis: rtt.as_micros() as f32 / 1000.,
-                            });
+                        match event {
+                            SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event {
+                                result: Ok(rtt),
+                                ..
+                            })) => {
+                                ping_count += 1;
+                                tracing::info!(?rtt, "{ping_count}/{PING_COUNT} pings successful");
+                                if ping_count >= PING_COUNT {
+                                    let start = handshake_start.unwrap_or_else(Instant::now);
+                                    return Ok(Report {
+                                        handshake_plus_one_rtt_millis: start.elapsed().as_micros()
+                                            as f32
+                                            / 1000.,
+                                        ping_rtt_millis: rtt.as_micros() as f32 / 1000.,
+                                    });
+                                }
+                            }
+                            SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event {
+                                result: Err(e),
+                                ..
+                            })) => {
+                                tracing::warn!(?e, "ping failed ({ping_count}/{PING_COUNT} so far)");
+                            }
+                            ev => tracing::debug!("{ev:?}"),
                         }
                     }
                 }

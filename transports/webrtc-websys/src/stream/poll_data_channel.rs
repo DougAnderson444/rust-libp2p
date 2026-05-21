@@ -16,52 +16,101 @@ use libp2p_webrtc_utils::MAX_MSG_LEN;
 use wasm_bindgen::prelude::*;
 use web_sys::{Event, MessageEvent, RtcDataChannel, RtcDataChannelEvent, RtcDataChannelState};
 
+/// Keeps JS event-handler closures alive. Shared by all [`PollDataChannel`] clones on one SCTP stream.
+struct ChannelHandlers {
+    _on_open: Rc<Closure<dyn FnMut(RtcDataChannelEvent)>>,
+    _on_write: Rc<Closure<dyn FnMut(Event)>>,
+    _on_close: Rc<Closure<dyn FnMut(Event)>>,
+    _on_message: Rc<Closure<dyn FnMut(MessageEvent)>>,
+}
+
 /// [`PollDataChannel`] is a wrapper around [`RtcDataChannel`] which implements [`AsyncRead`] and
 /// [`AsyncWrite`].
-#[derive(Debug, Clone)]
+///
+/// Cloned by [`libp2p_webrtc_utils::Stream`] (io + drop listener). The last clone must detach JS
+/// handlers before the closures are freed.
 pub(crate) struct PollDataChannel {
-    /// The [`RtcDataChannel`] being wrapped.
     inner: RtcDataChannel,
-
+    /// One per logical channel; used to know when to detach JS handlers on drop.
+    shares: Rc<()>,
     new_data_waker: Rc<AtomicWaker>,
     read_buffer: Rc<Mutex<BytesMut>>,
-
-    /// Waker for when we are waiting for the DC to be opened.
     open_waker: Rc<AtomicWaker>,
-
-    /// Waker for when we are waiting to write (again) to the DC because we previously exceeded the
-    /// [`MAX_MSG_LEN`] threshold.
     write_waker: Rc<AtomicWaker>,
-
-    /// Waker for when we are waiting for the DC to be closed.
     close_waker: Rc<AtomicWaker>,
-
-    /// Whether we've been overloaded with data by the remote.
-    ///
-    /// This is set to `true` in case `read_buffer` overflows, i.e. the remote is sending us
-    /// messages faster than we can read them. In that case, we return an [`std::io::Error`]
-    /// from [`AsyncRead`] or [`AsyncWrite`], depending which one gets called earlier.
-    /// Failing these will (very likely),
-    /// cause the application developer to drop the stream which resets it.
     overloaded: Rc<AtomicBool>,
+    _handlers: Rc<ChannelHandlers>,
+}
 
-    // Store the closures for proper garbage collection.
-    // These are wrapped in an [`Rc`] so we can implement [`Clone`].
-    _on_open_closure: Rc<Closure<dyn FnMut(RtcDataChannelEvent)>>,
-    _on_write_closure: Rc<Closure<dyn FnMut(Event)>>,
-    _on_close_closure: Rc<Closure<dyn FnMut(Event)>>,
-    _on_message_closure: Rc<Closure<dyn FnMut(MessageEvent)>>,
+fn detach_js_handlers(dc: &RtcDataChannel) {
+    let _ = dc.set_onopen(None);
+    let _ = dc.set_onmessage(None);
+    let _ = dc.set_onbufferedamountlow(None);
+    let _ = dc.set_onclose(None);
+}
+
+/// Wake the async task on a later turn of the event loop (never synchronously from `onmessage`).
+fn defer_waker_wake(waker: Rc<AtomicWaker>) {
+    let closure = Closure::once(move || {
+        waker.wake();
+    });
+    if let Some(window) = web_sys::window() {
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            closure.as_ref().unchecked_ref(),
+            0,
+        );
+    }
+    closure.forget();
+}
+
+impl Clone for PollDataChannel {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            shares: self.shares.clone(),
+            new_data_waker: self.new_data_waker.clone(),
+            read_buffer: self.read_buffer.clone(),
+            open_waker: self.open_waker.clone(),
+            write_waker: self.write_waker.clone(),
+            close_waker: self.close_waker.clone(),
+            overloaded: self.overloaded.clone(),
+            _handlers: self._handlers.clone(),
+        }
+    }
+}
+
+impl Drop for PollDataChannel {
+    fn drop(&mut self) {
+        if Rc::strong_count(&self.shares) == 1 {
+            detach_js_handlers(&self.inner);
+        }
+    }
 }
 
 impl PollDataChannel {
+    pub(crate) fn id(&self) -> Option<u16> {
+        self.inner.id().map(|id| id as u16)
+    }
+
+    pub(crate) fn ready_state(&self) -> RtcDataChannelState {
+        self.inner.ready_state()
+    }
+
     pub(crate) fn new(inner: RtcDataChannel) -> Self {
         let open_waker = Rc::new(AtomicWaker::new());
+        let inner_for_open = inner.clone();
         let on_open_closure = Closure::new({
             let open_waker = open_waker.clone();
+            let inner_for_open = inner_for_open.clone();
 
             move |_: RtcDataChannelEvent| {
-                tracing::trace!("DataChannel opened");
-                open_waker.wake();
+                tracing::debug!(
+                    target: "libp2p_webrtc_mux",
+                    dc_id = ?inner_for_open.id(),
+                    ready_state = ?inner_for_open.ready_state(),
+                    "data channel opened"
+                );
+                defer_waker_wake(open_waker.clone());
             }
         });
         inner.set_onopen(Some(on_open_closure.as_ref().unchecked_ref()));
@@ -73,7 +122,7 @@ impl PollDataChannel {
 
             move |_: Event| {
                 tracing::trace!("DataChannel available for writing (again)");
-                write_waker.wake();
+                defer_waker_wake(write_waker.clone());
             }
         });
         inner.set_onbufferedamountlow(Some(on_write_closure.as_ref().unchecked_ref()));
@@ -84,14 +133,12 @@ impl PollDataChannel {
 
             move |_: Event| {
                 tracing::trace!("DataChannel closed");
-                close_waker.wake();
+                defer_waker_wake(close_waker.clone());
             }
         });
         inner.set_onclose(Some(on_close_closure.as_ref().unchecked_ref()));
 
         let new_data_waker = Rc::new(AtomicWaker::new());
-        // We purposely don't use `with_capacity`
-        // so we don't eagerly allocate `MAX_READ_BUFFER` per stream.
         let read_buffer = Rc::new(Mutex::new(BytesMut::new()));
         let overloaded = Rc::new(AtomicBool::new(false));
 
@@ -112,29 +159,29 @@ impl PollDataChannel {
                 }
 
                 read_buffer.extend_from_slice(&data.to_vec());
-                new_data_waker.wake();
+                defer_waker_wake(new_data_waker.clone());
             }
         });
         inner.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
 
+        let handlers = Rc::new(ChannelHandlers {
+            _on_open: Rc::new(on_open_closure),
+            _on_write: Rc::new(on_write_closure),
+            _on_close: Rc::new(on_close_closure),
+            _on_message: Rc::new(on_message_closure),
+        });
+
         Self {
             inner,
+            shares: Rc::new(()),
             new_data_waker,
             read_buffer,
             open_waker,
             write_waker,
             close_waker,
             overloaded,
-            _on_open_closure: Rc::new(on_open_closure),
-            _on_write_closure: Rc::new(on_write_closure),
-            _on_close_closure: Rc::new(on_close_closure),
-            _on_message_closure: Rc::new(on_message_closure),
+            _handlers: handlers,
         }
-    }
-
-    /// Returns the [RtcDataChannelState] of the [RtcDataChannel]
-    fn ready_state(&self) -> RtcDataChannelState {
-        self.inner.ready_state()
     }
 
     /// Returns the current [RtcDataChannel] BufferedAmount
@@ -143,14 +190,14 @@ impl PollDataChannel {
     }
 
     /// Whether the data channel is ready for reading or writing.
-    fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        match self.ready_state() {
+    pub(crate) fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        match self.inner.ready_state() {
             RtcDataChannelState::Connecting => {
                 self.open_waker.register(cx.waker());
                 return Poll::Pending;
             }
             RtcDataChannelState::Closing | RtcDataChannelState::Closed => {
-                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
             }
             RtcDataChannelState::Open | RtcDataChannelState::__Invalid => {}
             _ => {}
@@ -184,9 +231,6 @@ impl AsyncRead for PollDataChannel {
             return Poll::Pending;
         }
 
-        // Ensure that we:
-        // - at most return what the caller can read (`buf.len()`)
-        // - at most what we have (`read_buffer.len()`)
         let split_index = min(buf.len(), read_buffer.len());
 
         let bytes_to_return = read_buffer.split_to(split_index);

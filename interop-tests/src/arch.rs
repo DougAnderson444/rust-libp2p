@@ -26,10 +26,26 @@ pub(crate) mod native {
 
     pub(crate) type Instant = std::time::Instant;
 
-    pub(crate) fn init_logger() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env())
-            .try_init();
+    /// Headroom for full transport upgrade (ICE + Noise). Real browsers usually finish
+    /// ICE in seconds; if you still hit this, suspect poll/headless issues, not slow ICE.
+    const WEBRTC_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
+    /// Match WASM dialer: default swarm idle timeout is 10s, but ping streams opt out of
+    /// keep-alive counting so long ping runs would close the listener prematurely.
+    const WEBRTC_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+    pub(crate) fn init_logger(_host_base: &str) {
+        let _ = tracing_log::LogTracer::init();
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new(
+                "info,\
+                 interop_tests=info,\
+                 libp2p_webrtc_mux=debug,\
+                 libp2p_ping=debug,\
+                 libp2p_swarm=debug,\
+                 libp2p_webrtc_utils=debug",
+            )
+        });
+        let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
     }
 
     pub(crate) fn sleep(duration: Duration) -> BoxFuture<'static, ()> {
@@ -146,6 +162,8 @@ pub(crate) mod native {
                         ))
                     })?
                     .with_behaviour(behaviour_constructor)?
+                    .with_swarm_config(|c| c.with_idle_connection_timeout(WEBRTC_IDLE_TIMEOUT))
+                    .with_connection_timeout(WEBRTC_CONNECTION_TIMEOUT)
                     .build(),
                 format!("/ip4/{ip}/udp/0/webrtc-direct"),
             ),
@@ -200,11 +218,16 @@ pub(crate) mod wasm {
 
     use crate::{BlpopRequest, Muxer, SecProtocol, Transport};
 
+    /// WASM dialer uses a short idle timeout for other transports; webrtc-direct needs longer.
+    const WEBRTC_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+    /// Headroom for full transport upgrade (ICE + Noise). Real browsers usually finish
+    /// ICE in seconds; if you still hit this, suspect poll/headless issues, not slow ICE.
+    const WEBRTC_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
+
     pub(crate) type Instant = web_time::Instant;
 
-    pub(crate) fn init_logger() {
-        console_error_panic_hook::set_once();
-        wasm_logger::init(wasm_logger::Config::default());
+    pub(crate) fn init_logger(host_base: &str) {
+        crate::host_log::init(host_base);
     }
 
     pub(crate) fn sleep(duration: Duration) -> BoxFuture<'static, ()> {
@@ -273,7 +296,8 @@ pub(crate) mod wasm {
                         webrtc_websys::Transport::new(webrtc_websys::Config::new(&local_key))
                     })?
                     .with_behaviour(behaviour_constructor)?
-                    .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(5)))
+                    .with_swarm_config(|c| c.with_idle_connection_timeout(WEBRTC_IDLE_TIMEOUT))
+                    .with_connection_timeout(WEBRTC_CONNECTION_TIMEOUT)
                     .build(),
                 format!("/ip4/{ip}/udp/0/webrtc-direct"),
             ),
