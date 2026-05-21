@@ -63,8 +63,6 @@ pub struct Stream<T> {
     io: FramedDc<T>,
     state: State,
     read_buffer: Bytes,
-    /// SCTP / WebRTC data-channel id when known (`0` = negotiated Noise only).
-    dc_id: Option<u16>,
     /// Dropping this will close the oneshot and notify the receiver by emitting `Canceled`.
     drop_notifier: Option<oneshot::Sender<GracefullyClosed>>,
 }
@@ -75,24 +73,18 @@ where
 {
     /// Returns a new [`Stream`] and a [`DropListener`],
     /// which will notify the receiver when/if the stream is dropped.
-    pub fn new(data_channel: T, dc_id: Option<u16>) -> (Self, DropListener<T>) {
+    pub fn new(data_channel: T) -> (Self, DropListener<T>) {
         let (sender, receiver) = oneshot::channel();
 
         let stream = Self {
             io: framed_dc::new(data_channel.clone()),
             state: State::Open,
             read_buffer: Bytes::default(),
-            dc_id,
             drop_notifier: Some(sender),
         };
-        let listener = DropListener::new(framed_dc::new(data_channel), receiver, dc_id);
+        let listener = DropListener::new(framed_dc::new(data_channel), receiver);
 
         (stream, listener)
-    }
-
-    /// WebRTC data-channel id for this libp2p substream, if known.
-    pub fn dc_id(&self) -> Option<u16> {
-        self.dc_id
     }
 
     /// Gracefully closes the "read-half" of the stream.

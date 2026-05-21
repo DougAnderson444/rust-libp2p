@@ -47,12 +47,6 @@ where
     // send application data 0.5 RTT earlier.
     let (peer_id, mut channel) = noise.upgrade_outbound(stream, info).await?;
 
-    tracing::debug!(
-        target: "libp2p_webrtc_mux",
-        peer=%peer_id,
-        dc_id = 0u16,
-        "noise inbound: closing negotiated handshake channel (not muxer)"
-    );
     channel.close().await?;
 
     Ok(peer_id)
@@ -75,12 +69,6 @@ where
     // send application data 0.5 RTT earlier.
     let (peer_id, mut channel) = noise.upgrade_inbound(stream, info).await?;
 
-    tracing::debug!(
-        target: "libp2p_webrtc_mux",
-        peer=%peer_id,
-        dc_id = 0u16,
-        "noise outbound: closing negotiated handshake channel (not muxer)"
-    );
     channel.close().await?;
 
     Ok(peer_id)

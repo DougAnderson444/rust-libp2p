@@ -232,7 +232,7 @@ where
                             });
 
                             let message = if protocol.is_some() {
-                                tracing::debug!(target: "libp2p_webrtc_mux", protocol=%p, "Listener: confirming protocol");
+                                tracing::debug!(protocol=%p, "Listener: confirming protocol");
                                 Message::Protocol(p.clone())
                             } else {
                                 tracing::debug!(protocol=%p.as_ref(), "Listener: rejecting protocol");
@@ -292,7 +292,6 @@ where
                             match protocol {
                                 Some(protocol) => {
                                     tracing::debug!(
-                                        target: "libp2p_webrtc_mux",
                                         protocol=%protocol.as_ref(),
                                         "Listener: sent confirmed protocol"
                                     );

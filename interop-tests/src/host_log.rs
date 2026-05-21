@@ -130,17 +130,7 @@ pub(crate) fn init(host_base: &str) {
     let _ = HOST_BASE.set(host);
     let _ = PENDING.set(Mutex::new(Vec::new()));
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new(
-            "info,\
-             interop_tests=info,\
-             libp2p_webrtc_websys=debug,\
-             libp2p_webrtc_mux=debug,\
-             libp2p_ping=debug,\
-             libp2p_swarm=debug,\
-             libp2p_webrtc_utils=debug",
-        )
-    });
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let _ = Registry::default()
         .with(filter)

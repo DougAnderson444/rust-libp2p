@@ -98,18 +98,10 @@ impl PollDataChannel {
 
     pub(crate) fn new(inner: RtcDataChannel) -> Self {
         let open_waker = Rc::new(AtomicWaker::new());
-        let inner_for_open = inner.clone();
         let on_open_closure = Closure::new({
             let open_waker = open_waker.clone();
-            let inner_for_open = inner_for_open.clone();
 
             move |_: RtcDataChannelEvent| {
-                tracing::debug!(
-                    target: "libp2p_webrtc_mux",
-                    dc_id = ?inner_for_open.id(),
-                    ready_state = ?inner_for_open.ready_state(),
-                    "data channel opened"
-                );
                 defer_waker_wake(open_waker.clone());
             }
         });

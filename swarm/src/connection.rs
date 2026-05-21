@@ -275,10 +275,6 @@ where
             match requested_substreams.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(()))) => continue,
                 Poll::Ready(Some(Err(info))) => {
-                    tracing::debug!(
-                        target: "libp2p_webrtc_mux",
-                        "outbound substream request timed out waiting for muxer (not yet negotiating)"
-                    );
                     handler.on_connection_event(ConnectionEvent::DialUpgradeError(
                         DialUpgradeError {
                             info,
@@ -340,12 +336,6 @@ where
                     continue;
                 }
                 Poll::Ready(Some((info, Err(error)))) => {
-                    if matches!(error, StreamUpgradeError::Timeout) {
-                        tracing::debug!(
-                            target: "libp2p_webrtc_mux",
-                            "outbound substream upgrade timed out during multistream-select"
-                        );
-                    }
                     handler.on_connection_event(ConnectionEvent::DialUpgradeError(
                         DialUpgradeError { info, error },
                     ));
@@ -378,10 +368,7 @@ where
                     continue;
                 }
                 Poll::Ready(Some((_, Err(StreamUpgradeError::Timeout)))) => {
-                    tracing::debug!(
-                        target: "libp2p_webrtc_mux",
-                        "inbound substream upgrade timed out during multistream-select"
-                    );
+                    tracing::debug!("inbound stream upgrade timed out");
                     continue;
                 }
             }

@@ -135,7 +135,7 @@ where
                     if let Err(err) = Pin::new(&mut io).start_send(Message::Protocol(p.clone())) {
                         return Poll::Ready(Err(From::from(err)));
                     }
-                    tracing::debug!(target: "libp2p_webrtc_mux", protocol=%p, "Dialer: Proposed protocol");
+                    tracing::debug!(protocol=%p, "Dialer: Proposed protocol");
 
                     if this.protocols.peek().is_some() {
                         *this.state = State::FlushProtocol { io, protocol }
@@ -184,7 +184,7 @@ where
                             *this.state = State::AwaitProtocol { io, protocol };
                         }
                         Message::Protocol(ref p) if p.as_ref() == protocol.as_ref() => {
-                            tracing::debug!(target: "libp2p_webrtc_mux", protocol=%p, "Dialer: Received confirmation for protocol");
+                            tracing::debug!(protocol=%p, "Dialer: Received confirmation for protocol");
                             let io = Negotiated::completed(io.into_inner());
                             return Poll::Ready(Ok((protocol, io)));
                         }

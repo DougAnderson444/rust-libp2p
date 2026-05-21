@@ -43,11 +43,10 @@ impl Stream {
     /// Returns a new `Substream` and a listener, which will notify the receiver when/if the
     /// substream is dropped.
     pub(crate) fn new(data_channel: Arc<DataChannel>) -> (Self, DropListener) {
-        let dc_id = data_channel.stream_identifier();
         let mut data_channel = PollDataChannel::new(data_channel).compat();
         data_channel.get_mut().set_read_buf_capacity(MAX_MSG_LEN);
 
-        let (inner, drop_listener) = libp2p_webrtc_utils::Stream::new(data_channel, Some(dc_id));
+        let (inner, drop_listener) = libp2p_webrtc_utils::Stream::new(data_channel);
 
         (Self { inner }, drop_listener)
     }

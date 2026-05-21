@@ -40,11 +40,10 @@ pub struct Connection {
     /// A list of futures, which, once completed, signal that a [`Stream`] has been dropped.
     drop_listeners: FuturesUnordered<DropListener>,
     no_drop_listeners_waker: Option<Waker>,
-    /// Monotonic muxer substream counter (independent of SCTP id).
-    mux_inbound_count: u32,
-    mux_outbound_count: u32,
-    /// Outbound data channel waiting for `open` before handing to the muxer (like native webrtc).
+    /// Outbound data channel waiting for `open` before handing to the muxer.
     outbound_opening: Option<(SendWrapper<RtcDataChannel>, SendWrapper<PollDataChannel>)>,
+    /// Inbound mux substreams received so far (used to end outbound defer early).
+    inbound_mux_count: u32,
     /// Browser (DTLS client) opens even SCTP ids; defer so the answerer's odd channels land first.
     outbound_defer: Option<Pin<Box<Delay>>>,
     outbound_defer_done: bool,
@@ -93,9 +92,8 @@ impl Connection {
             drop_listeners: FuturesUnordered::default(),
             no_drop_listeners_waker: None,
             inbound_data_channels: SendWrapper::new(rx_ondatachannel),
-            mux_inbound_count: 0,
-            mux_outbound_count: 0,
             outbound_opening: None,
+            inbound_mux_count: 0,
             outbound_defer: None,
             outbound_defer_done: false,
             outbound_defer_waker: None,
@@ -146,22 +144,11 @@ impl StreamMuxer for Connection {
             match ready!(self.inbound_data_channels.poll_next_unpin(cx)) {
                 Some(data_channel) => {
                     if data_channel.id() == Some(0) {
-                        tracing::debug!(
-                            target: "libp2p_webrtc_mux",
-                            "ignoring inbound data channel id=0 (negotiated noise, not muxer)"
-                        );
                         continue;
                     }
-                    self.mux_inbound_count += 1;
-                    tracing::debug!(
-                        target: "libp2p_webrtc_mux",
-                        mux_index = self.mux_inbound_count,
-                        dc_id = ?data_channel.id(),
-                        ready_state = ?data_channel.ready_state(),
-                        "muxer inbound substream ready"
-                    );
+                    self.inbound_mux_count += 1;
                     let stream = self.new_stream_from_poll_channel(PollDataChannel::new(data_channel));
-                    if self.mux_inbound_count >= 2 && !self.outbound_defer_done {
+                    if self.inbound_mux_count >= 2 && !self.outbound_defer_done {
                         self.outbound_defer_done = true;
                         self.outbound_defer = None;
                         if let Some(waker) = self.outbound_defer_waker.take() {
@@ -187,10 +174,6 @@ impl StreamMuxer for Connection {
         if !self.outbound_defer_done {
             if self.outbound_defer.is_none() {
                 self.outbound_defer = Some(Box::pin(Delay::new(Duration::from_millis(400))));
-                tracing::debug!(
-                    target: "libp2p_webrtc_mux",
-                    "offerer: deferring first outbound mux channel for answerer DCEP"
-                );
             }
             self.outbound_defer_waker = Some(cx.waker().clone());
             if self
@@ -205,21 +188,11 @@ impl StreamMuxer for Connection {
             self.outbound_defer = None;
             self.outbound_defer_waker = None;
             self.outbound_defer_done = true;
-            tracing::debug!(
-                target: "libp2p_webrtc_mux",
-                "offerer: opening first outbound mux channel"
-            );
         }
 
         loop {
             if self.outbound_opening.is_none() {
                 let dc = self.inner.new_regular_data_channel();
-                tracing::debug!(
-                    target: "libp2p_webrtc_mux",
-                    dc_id = ?dc.id(),
-                    ready_state = ?dc.ready_state(),
-                    "opening muxer outbound data channel"
-                );
                 let poll_dc = PollDataChannel::new(dc.clone());
                 self.outbound_opening = Some((SendWrapper::new(dc), SendWrapper::new(poll_dc)));
             }
@@ -238,14 +211,6 @@ impl StreamMuxer for Connection {
                 Poll::Ready(Ok(())) => {
                     let (_dc, poll_dc) = self.outbound_opening.take().expect("just polled");
                     let poll_dc = poll_dc.take();
-                    self.mux_outbound_count += 1;
-                    tracing::debug!(
-                        target: "libp2p_webrtc_mux",
-                        mux_index = self.mux_outbound_count,
-                        dc_id = ?poll_dc.id(),
-                        ready_state = ?poll_dc.ready_state(),
-                        "muxer outbound substream ready"
-                    );
                     return Poll::Ready(Ok(self.new_stream_from_poll_channel(poll_dc)));
                 }
             }
@@ -284,7 +249,6 @@ impl StreamMuxer for Connection {
 
 pub(crate) struct RtcPeerConnection {
     inner: web_sys::RtcPeerConnection,
-    _ice_state_log: SendWrapper<Closure<dyn FnMut(web_sys::Event)>>,
 }
 
 impl RtcPeerConnection {
@@ -309,22 +273,12 @@ impl RtcPeerConnection {
         config.set_certificates(&certificate_arr);
 
         let inner = web_sys::RtcPeerConnection::new_with_configuration(&config)?;
-        let ice_state_log = attach_ice_state_logging(&inner);
 
-        Ok(Self {
-            inner,
-            _ice_state_log: SendWrapper::new(ice_state_log),
-        })
+        Ok(Self { inner })
     }
 
     /// Creates negotiated data channel 0 for Noise (must exist before creating the SDP offer).
     pub(crate) fn create_handshake_data_channel(&self) -> RtcDataChannel {
-        tracing::debug!(
-            target: "libp2p_webrtc_mux",
-            dc_id = 0u16,
-            negotiated = true,
-            "creating noise handshake data channel (not a muxer substream)"
-        );
         self.new_data_channel(true)
     }
 
@@ -367,14 +321,6 @@ impl RtcPeerConnection {
             false => self.inner.create_data_channel(LABEL),
         };
         dc.set_binary_type(RtcDataChannelType::Arraybuffer); // Hardcoded here, it's the only type we use
-
-        tracing::debug!(
-            target: "libp2p_webrtc_mux",
-            negotiated,
-            dc_id = ?dc.id(),
-            ready_state = ?dc.ready_state(),
-            "created data channel"
-        );
 
         dc
     }
@@ -422,19 +368,6 @@ impl RtcPeerConnection {
 
         Ok(())
     }
-}
-
-fn attach_ice_state_logging(pc: &web_sys::RtcPeerConnection) -> Closure<dyn FnMut(web_sys::Event)> {
-    let pc_log = pc.clone();
-    let closure = Closure::wrap(Box::new(move |_: web_sys::Event| {
-        tracing::debug!(
-            target: "libp2p_webrtc_mux",
-            ice_connection_state = ?pc_log.ice_connection_state(),
-            "RtcPeerConnection ICE state"
-        );
-    }) as Box<dyn FnMut(web_sys::Event)>);
-    pc.set_oniceconnectionstatechange(Some(closure.as_ref().unchecked_ref()));
-    closure
 }
 
 /// Parse Fingerprint from a SDP.

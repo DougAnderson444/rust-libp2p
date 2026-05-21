@@ -46,17 +46,7 @@ async fn outbound_inner(
     tracing::trace!(?remote_fingerprint);
 
     // ICE/DTLS must finish and DC 0 must be `open` before Noise (browser is event-driven).
-    tracing::debug!(
-        target: "libp2p_webrtc_mux",
-        "SDP applied; waiting for browser ICE/DTLS (see RtcPeerConnection state logs)"
-    );
     let handshake_poll = RtcPeerConnection::wait_data_channel_open(&handshake_dc).await?;
-    tracing::debug!(
-        target: "libp2p_webrtc_mux",
-        dc_id = ?handshake_poll.id(),
-        ready_state = ?handshake_poll.ready_state(),
-        "noise handshake channel open, starting noise"
-    );
 
     let (channel, listener) =
         RtcPeerConnection::handshake_stream_from_poll_channel(handshake_poll);
