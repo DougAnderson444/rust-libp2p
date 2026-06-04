@@ -42,8 +42,7 @@ struct TestState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // When `RUST_LOG` is unset, `from_default_env()` only enables `error!`, which hides
-    // progress from this host-side harness. Default to `info` unless the user opted in.
+    // start logging
     let env_filter = match std::env::var_os("RUST_LOG") {
         Some(_) => EnvFilter::try_from_default_env().context("invalid `RUST_LOG` filter")?,
         None => EnvFilter::builder()
@@ -110,7 +109,6 @@ async fn main() -> Result<()> {
         Err(_) => Err("Test timed out".to_owned()),
     };
 
-
     // Close the browser after we got the results
     driver.quit().await?;
     chrome.kill().await?;
@@ -146,10 +144,9 @@ async fn open_in_browser(headless: bool) -> Result<(Child, WebDriver)> {
     let mut reader = BufReader::new(driver_out).lines();
     while let Some(line) = reader.next_line().await? {
         tracing::debug!(chromedriver_stdout = %line, "chromedriver log line");
-        // Match several ChromeDriver versions: older lines ended with "successfully.";
-        // newer builds say "successfully on port …" (no period right after "successfully").
+        // "successfully" line format varies by ChromeDriver version (trailing period optional).
         if line.contains("ChromeDriver was started successfully") {
-                    break;
+            break;
         }
     }
 
@@ -192,11 +189,8 @@ async fn redis_blpop(
     Ok(Json(res))
 }
 
-/// Receive batched log lines from the in-browser WASM dialer.
 async fn host_log(Json(batch): Json<WasmLogBatch>) -> StatusCode {
     for line in batch.lines {
-        // Dialer logs at DEBUG so they do not drown out harness INFO/DEBUG (chromedriver, HTTP).
-        // Enable with `RUST_LOG=wasm=debug` or `RUST_LOG=debug`.
         if line.starts_with("WARN ") || line.starts_with("ERROR ") {
             tracing::warn!(target: "wasm", "{line}");
         } else {

@@ -59,6 +59,7 @@ impl Connection {
         let ondatachannel_closure = Closure::new(move |ev: RtcDataChannelEvent| {
             let channel = ev.channel();
             let mut tx = tx_ondatachannel.clone();
+            // Deliver on the next event-loop turn (not synchronously from `ondatachannel`).
             let deliver = Closure::once(move || {
                 tracing::trace!("New data channel");
                 if let Err(e) = tx.try_send(channel) {
@@ -141,10 +142,12 @@ impl StreamMuxer for Connection {
             match ready!(self.inbound_data_channels.poll_next_unpin(cx)) {
                 Some(data_channel) => {
                     if data_channel.id() == Some(0) {
+                        // Negotiated Noise handshake channel (id 0), not a mux substream.
                         continue;
                     }
                     self.inbound_mux_count += 1;
                     let stream = self.new_stream_from_poll_channel(PollDataChannel::new(data_channel));
+                    // Two inbound mux substreams: cancel outbound defer early (browser offerer).
                     if self.inbound_mux_count >= 2 && !self.outbound_defer_done {
                         self.outbound_defer_done = true;
                         self.outbound_defer = None;
@@ -168,6 +171,7 @@ impl StreamMuxer for Connection {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
+        // Browser offerer: defer outbound mux channels so remote inbound DCEP lands first.
         if !self.outbound_defer_done {
             if self.outbound_defer.is_none() {
                 self.outbound_defer = Some(Box::pin(Delay::new(Duration::from_millis(400))));
@@ -188,6 +192,7 @@ impl StreamMuxer for Connection {
         }
 
         loop {
+            // Wait for `open` before handing the channel to the muxer.
             if self.outbound_opening.is_none() {
                 let dc = self.inner.new_regular_data_channel();
                 let poll_dc = PollDataChannel::new(dc.clone());
@@ -262,7 +267,7 @@ impl RtcPeerConnection {
         let certificate = JsFuture::from(certificate_promise).await?;
 
         let config = RtcConfiguration::default();
-        // No STUN/TURN — webrtc-direct uses explicit host candidates in the synthetic SDP answer.
+        // webrtc-direct: host candidates only (no STUN/TURN).
         config.set_ice_servers(&js_sys::Array::new());
         // wrap certificate in a js Array first before adding it to the config object
         let certificate_arr = js_sys::Array::new();
@@ -274,7 +279,7 @@ impl RtcPeerConnection {
         Ok(Self { inner })
     }
 
-    /// Creates the stream for the initial noise handshake.
+    /// Creates the data channel for the initial Noise handshake.
     ///
     /// The underlying data channel MUST have `negotiated` set to `true` and carry the ID 0.
     pub(crate) fn create_handshake_data_channel(&self) -> RtcDataChannel {

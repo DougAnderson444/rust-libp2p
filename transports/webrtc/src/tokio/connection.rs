@@ -77,11 +77,7 @@ pub struct Connection {
 impl Unpin for Connection {}
 
 impl Connection {
-    /// Registers [`RTCPeerConnection::on_data_channel`] and returns the receiver for muxer inbound
-    /// substreams.
-    ///
-    /// Must be called **before** `set_remote_description` / `set_local_description` so DCEP and
-    /// SCTP-negotiated channels from the remote peer are not dropped.
+    // Register `on_data_channel` before `set_remote_description` so inbound channels are not dropped.
     pub(crate) async fn setup_incoming_data_channels(
         rtc_conn: &RTCPeerConnection,
     ) -> mpsc::Receiver<Arc<DetachedDataChannel>> {
@@ -126,11 +122,8 @@ impl Connection {
         tx: Arc<FutMutex<mpsc::Sender<Arc<DetachedDataChannel>>>>,
     ) {
         rtc_conn.on_data_channel(Box::new(move |data_channel: Arc<RTCDataChannel>| {
-            // Stream 0 is the negotiated Noise handshake channel. Ignore only that case.
-            //
-            // Do **not** filter on `id() == 0` alone: webrtc-rs invokes this handler before the
-            // SCTP stream id is copied onto `RTCDataChannel`, so inbound DCEP channels (2, 4, …)
-            // also appear as id=0 with negotiated=false until `handle_open` runs.
+            // Ignore negotiated stream 0 (Noise). Do not filter on `id() == 0` alone: webrtc-rs
+            // invokes this handler before the SCTP stream id is assigned on inbound DCEP channels.
             if data_channel.negotiated() && data_channel.id() == 0 {
                 return Box::pin(async {});
             }
@@ -193,6 +186,7 @@ impl StreamMuxer for Connection {
                 tracing::trace!(stream=%detached.stream_identifier(), "Incoming stream");
 
                 self.inbound_mux_count += 1;
+                // First inbound mux substream: cancel outbound defer early (native answerer).
                 if self.inbound_mux_count == 1 && !self.outbound_defer_done {
                     self.outbound_defer_done = true;
                     self.outbound_defer = None;

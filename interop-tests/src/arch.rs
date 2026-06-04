@@ -26,11 +26,8 @@ pub(crate) mod native {
 
     pub(crate) type Instant = std::time::Instant;
 
-    /// Headroom for full transport upgrade (ICE + Noise). Real browsers usually finish
-    /// ICE in seconds; if you still hit this, suspect poll/headless issues, not slow ICE.
+    // Swarm default idle timeout is 10s; 12 ping rounds need longer on webrtc-direct.
     const WEBRTC_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
-    /// Match WASM dialer: default swarm idle timeout is 10s, but ping streams opt out of
-    /// keep-alive counting so long ping runs would close the listener prematurely.
     const WEBRTC_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
     pub(crate) fn init_logger(_host_base: &str) {
@@ -177,7 +174,6 @@ pub(crate) mod native {
             Ok(conn.blpop(key, timeout as f64).await?)
         }
 
-        /// Remove `key` so manual runs do not consume a stale `listenerAddr` left in Redis.
         pub(crate) async fn del(&self, key: &str) -> Result<()> {
             let mut conn = self.0.get_async_connection().await?;
             let _: () = conn.del(key).await?;
@@ -209,10 +205,8 @@ pub(crate) mod wasm {
 
     use crate::{BlpopRequest, Muxer, SecProtocol, Transport};
 
-    /// WASM dialer uses a short idle timeout for other transports; webrtc-direct needs longer.
+    // Match native listener: long enough for 12 ping rounds (default WASM idle was 5s).
     const WEBRTC_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-    /// Headroom for full transport upgrade (ICE + Noise). Real browsers usually finish
-    /// ICE in seconds; if you still hit this, suspect poll/headless issues, not slow ICE.
     const WEBRTC_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 
     pub(crate) type Instant = web_time::Instant;
@@ -304,9 +298,8 @@ pub(crate) mod wasm {
         }
 
         pub(crate) async fn blpop(&self, key: &str, timeout: u64) -> Result<Vec<String>> {
-            let url = format!("http://{}/blpop", self.0);
             let res = reqwest::Client::new()
-                .post(&url)
+                .post(&format!("http://{}/blpop", self.0))
                 .json(&BlpopRequest {
                     key: key.to_owned(),
                     timeout,

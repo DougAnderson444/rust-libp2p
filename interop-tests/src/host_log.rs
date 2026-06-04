@@ -1,7 +1,4 @@
-//! Forward `tracing` events from the WASM dialer to the `wasm_ping` host process.
-//!
-//! Headless Chrome does not surface `console.log` in the terminal; the harness exposes
-//! `POST /log` and this layer batches lines there (shown as `target: "wasm"`).
+//! Forward WASM `tracing` events to the `wasm_ping` host via `POST /log`.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -68,7 +65,6 @@ where
             message: String::new(),
         };
         event.record(&mut visitor);
-        // Compact single line; the harness adds level/target when printing.
         let line = if visitor.message.is_empty() {
             format!("{level} {}:(event)", meta.target())
         } else {
@@ -118,7 +114,6 @@ async fn flush_loop() {
     }
 }
 
-/// Install tracing: browser console (optional) + HTTP proxy to the host harness.
 pub(crate) fn init(host_base: &str) {
     console_error_panic_hook::set_once();
 

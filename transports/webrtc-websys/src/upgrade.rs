@@ -26,7 +26,8 @@ async fn outbound_inner(
 ) -> Result<(PeerId, Connection), Error> {
     let rtc_peer_connection = RtcPeerConnection::new(remote_fingerprint.algorithm()).await?;
 
-    // Negotiated DC 0 must be created before the offer so it is present in the SDP.
+    // Create stream for Noise handshake
+    // Must create data channel before Offer is created for it to be included in the SDP
     let handshake_dc = rtc_peer_connection.create_handshake_data_channel();
 
     let ufrag = libp2p_webrtc_utils::sdp::random_ufrag();
@@ -45,7 +46,7 @@ async fn outbound_inner(
     tracing::trace!(?local_fingerprint);
     tracing::trace!(?remote_fingerprint);
 
-    // ICE/DTLS must finish and DC 0 must be `open` before Noise (browser is event-driven).
+    // Wait until ICE/DTLS are up and DC 0 is `open` before Noise (browser is event-driven).
     let handshake_poll = RtcPeerConnection::wait_data_channel_open(&handshake_dc).await?;
 
     let (channel, listener) =

@@ -18,7 +18,6 @@ mod host_log;
 
 use arch::{build_swarm, init_logger, Instant, RedisClient};
 
-/// Batched log lines from the WASM dialer (`POST /log` on the harness).
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct WasmLogBatch {
     pub lines: Vec<String>,
@@ -73,10 +72,7 @@ pub async fn run_test(
     // Run a ping interop test. Based on `is_dialer`, either dial the address
     // retrieved via `listenAddr` key over the redis connection. Or wait to be pinged and have
     // `dialerDone` key ready on the redis connection.
-    // Number of successful pings required before the test is considered passing.
-    // Using more than one exercises that subsequent messages (not just the first)
-    // can flow over the connection — important for WebRTC where the Noise substream
-    // close semantics caused later bytes to stall.
+    // Require multiple pings so mux substreams carry bytes after the Noise handshake channel.
     const PING_COUNT: u32 = 12;
 
     match is_dialer {
@@ -152,7 +148,7 @@ pub async fn run_test(
                     }
                     if listener_id == id {
                         let ma = format!("{address}/p2p/{}", swarm.local_peer_id());
-                        // BLPOP pops the oldest list element; drop any leftover rows from prior runs.
+                        // Drop stale `listenerAddr` entries from prior manual runs (BLPOP is FIFO).
                         redis_client.del("listenerAddr").await?;
                         redis_client.rpush("listenerAddr", ma.clone()).await?;
                         break;
@@ -160,8 +156,6 @@ pub async fn run_test(
                 }
             }
 
-            // Exit once PING_COUNT pings succeed — exercises that bytes beyond the first
-            // message can still flow over the connection.
             let mut handshake_start = None;
             match futures::future::select(
                 async move {
