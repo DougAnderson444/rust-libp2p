@@ -40,11 +40,8 @@ pub struct Connection {
     /// A list of futures, which, once completed, signal that a [`Stream`] has been dropped.
     drop_listeners: FuturesUnordered<DropListener>,
     no_drop_listeners_waker: Option<Waker>,
-    /// Outbound data channel waiting for `open` before handing to the muxer.
     outbound_opening: Option<(SendWrapper<RtcDataChannel>, SendWrapper<PollDataChannel>)>,
-    /// Inbound mux substreams received so far (used to end outbound defer early).
     inbound_mux_count: u32,
-    /// Browser (DTLS client) opens even SCTP ids; defer so the answerer's odd channels land first.
     outbound_defer: Option<Pin<Box<Delay>>>,
     outbound_defer_done: bool,
     outbound_defer_waker: Option<Waker>,
@@ -277,19 +274,19 @@ impl RtcPeerConnection {
         Ok(Self { inner })
     }
 
-    /// Creates negotiated data channel 0 for Noise (must exist before creating the SDP offer).
+    /// Creates the stream for the initial noise handshake.
+    ///
+    /// The underlying data channel MUST have `negotiated` set to `true` and carry the ID 0.
     pub(crate) fn create_handshake_data_channel(&self) -> RtcDataChannel {
         self.new_data_channel(true)
     }
 
-    /// Wraps an open handshake channel as a libp2p [`Stream`].
     pub(crate) fn handshake_stream_from_poll_channel(
         poll_channel: crate::stream::poll_data_channel::PollDataChannel,
     ) -> (Stream, DropListener) {
         Stream::from_poll_channel(poll_channel)
     }
 
-    /// Blocks until the channel leaves `connecting` (ICE + DTLS must be up).
     pub(crate) async fn wait_data_channel_open(
         dc: &RtcDataChannel,
     ) -> Result<crate::stream::poll_data_channel::PollDataChannel, Error> {
@@ -301,11 +298,6 @@ impl RtcPeerConnection {
         self.new_data_channel(false)
     }
 
-    /// Creates a data channel.
-    ///
-    /// - `negotiated = true`: fixed SCTP stream **id 0** for Noise (both peers must create it).
-    /// - `negotiated = false`: browser/stack assigns the next id (1, 2, 3, …); each muxer
-    ///   substream is a **new** id, not “the first of its kind” as 0.
     fn new_data_channel(&self, negotiated: bool) -> RtcDataChannel {
         const LABEL: &str = "";
 

@@ -24,10 +24,7 @@ pub struct Stream {
 
 pub(crate) type DropListener = SendWrapper<libp2p_webrtc_utils::DropListener<PollDataChannel>>;
 
-/// Blocks until the data channel leaves `connecting` (ICE + DTLS must be up).
-///
-/// Returns the [`PollDataChannel`] so callers do not call [`PollDataChannel::new`] twice on the
-/// same [`RtcDataChannel`] (that drops the first JS closures while the browser may still invoke them).
+// Wait until ICE + DTLS are up; return the [`PollDataChannel`] so we do not call [`PollDataChannel::new`] twice.
 pub(crate) async fn wait_until_open(dc: &RtcDataChannel) -> Result<PollDataChannel, Error> {
     let mut poll_dc = PollDataChannel::new(dc.clone());
     poll_fn(|cx| -> Poll<Result<(), Error>> {

@@ -68,9 +68,7 @@ pub struct Connection {
     /// A list of futures, which, once completed, signal that a [`Stream`] has been dropped.
     drop_listeners: FuturesUnordered<stream::DropListener>,
     no_drop_listeners_waker: Option<Waker>,
-    /// Inbound mux substreams received so far (used to end outbound defer early).
     inbound_mux_count: u32,
-    /// Brief delay before the first outbound mux channel (browser offerer → native answerer interop).
     outbound_defer: Option<Pin<Box<Delay>>>,
     outbound_defer_waker: Option<Waker>,
     outbound_defer_done: bool,

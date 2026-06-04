@@ -16,7 +16,8 @@ use libp2p_webrtc_utils::MAX_MSG_LEN;
 use wasm_bindgen::prelude::*;
 use web_sys::{Event, MessageEvent, RtcDataChannel, RtcDataChannelEvent, RtcDataChannelState};
 
-/// Keeps JS event-handler closures alive. Shared by all [`PollDataChannel`] clones on one SCTP stream.
+// Store the closures for proper garbage collection.
+// These are wrapped in an [`Rc`] so we can implement [`Clone`].
 struct ChannelHandlers {
     _on_open: Rc<Closure<dyn FnMut(RtcDataChannelEvent)>>,
     _on_write: Rc<Closure<dyn FnMut(Event)>>,
@@ -26,19 +27,34 @@ struct ChannelHandlers {
 
 /// [`PollDataChannel`] is a wrapper around [`RtcDataChannel`] which implements [`AsyncRead`] and
 /// [`AsyncWrite`].
-///
-/// Cloned by [`libp2p_webrtc_utils::Stream`] (io + drop listener). The last clone must detach JS
-/// handlers before the closures are freed.
 pub(crate) struct PollDataChannel {
+    /// The [`RtcDataChannel`] being wrapped.
     inner: RtcDataChannel,
-    /// One per logical channel; used to know when to detach JS handlers on drop.
+
     shares: Rc<()>,
+
     new_data_waker: Rc<AtomicWaker>,
     read_buffer: Rc<Mutex<BytesMut>>,
+
+    /// Waker for when we are waiting for the DC to be opened.
     open_waker: Rc<AtomicWaker>,
+
+    /// Waker for when we are waiting to write (again) to the DC because we previously exceeded the
+    /// [`MAX_MSG_LEN`] threshold.
     write_waker: Rc<AtomicWaker>,
+
+    /// Waker for when we are waiting for the DC to be closed.
     close_waker: Rc<AtomicWaker>,
+
+    /// Whether we've been overloaded with data by the remote.
+    ///
+    /// This is set to `true` in case `read_buffer` overflows, i.e. the remote is sending us
+    /// messages faster than we can read them. In that case, we return an [`std::io::Error`]
+    /// from [`AsyncRead`] or [`AsyncWrite`], depending which one gets called earlier.
+    /// Failing these will (very likely),
+    /// cause the application developer to drop the stream which resets it.
     overloaded: Rc<AtomicBool>,
+
     _handlers: Rc<ChannelHandlers>,
 }
 
@@ -49,7 +65,7 @@ fn detach_js_handlers(dc: &RtcDataChannel) {
     let _ = dc.set_onclose(None);
 }
 
-/// Wake the async task on a later turn of the event loop (never synchronously from `onmessage`).
+// Wake the async task on a later turn of the event loop (never synchronously from `onmessage`).
 fn defer_waker_wake(waker: Rc<AtomicWaker>) {
     let closure = Closure::once(move || {
         waker.wake();
@@ -92,6 +108,7 @@ impl PollDataChannel {
         self.inner.id().map(|id| id as u16)
     }
 
+    /// Returns the [RtcDataChannelState] of the [RtcDataChannel]
     pub(crate) fn ready_state(&self) -> RtcDataChannelState {
         self.inner.ready_state()
     }
@@ -131,6 +148,8 @@ impl PollDataChannel {
         inner.set_onclose(Some(on_close_closure.as_ref().unchecked_ref()));
 
         let new_data_waker = Rc::new(AtomicWaker::new());
+        // We purposely don't use `with_capacity`
+        // so we don't eagerly allocate `MAX_READ_BUFFER` per stream.
         let read_buffer = Rc::new(Mutex::new(BytesMut::new()));
         let overloaded = Rc::new(AtomicBool::new(false));
 
@@ -223,6 +242,9 @@ impl AsyncRead for PollDataChannel {
             return Poll::Pending;
         }
 
+        // Ensure that we:
+        // - at most return what the caller can read (`buf.len()`)
+        // - at most what we have (`read_buffer.len()`)
         let split_index = min(buf.len(), read_buffer.len());
 
         let bytes_to_return = read_buffer.split_to(split_index);
